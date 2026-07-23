@@ -20,6 +20,28 @@ class GroupSnapshot:
 
 
 @dataclass
+class UnitStats:
+    name: str                    # the SPEC string as given, e.g. "myapp.jobs:process_receivable"
+    wrapped: bool                # True once the target was actually patched (else nothing ran)
+    count: int                   # number of top-level unit executions recorded
+    median_duration: float       # seconds
+    mean_duration: float         # seconds
+    median_queries: float
+    mean_queries: float
+    mean_commits: float
+    mean_rollbacks: float
+    mean_rows: float
+    first_window_n: int          # units in the FIRST window (<= 100)
+    first_window_mean_duration: "float | None"   # None if no units yet
+    last_window_n: int           # units in the LAST window (<= 100)
+    last_window_mean_duration: "float | None"    # None if no units yet
+    # v0.3 hardening (D4): per-unit query-slope windows. APPENDED after the
+    # existing fields so positional consumers (rules/report/tests) are unaffected.
+    first_window_mean_queries: "float | None"    # None if no units yet
+    last_window_mean_queries: "float | None"     # None if no units yet
+
+
+@dataclass
 class RunSnapshot:
     wall_time: float             # seconds
     cpu_time: "float | None"     # process user+sys CPU seconds (os.times); None if unmeasurable
@@ -32,6 +54,10 @@ class RunSnapshot:
     overhead_time: float         # recorder's own measured hook time, seconds
     sqlalchemy_active: bool      # were hooks installed and did SQLAlchemy get used
     groups: "list[GroupSnapshot]" = field(default_factory=list)
+    unit_stats: "UnitStats | None" = None
+    # v0.3 hardening (D2): DBAPI rollback time, split out of commit_time. None
+    # when not measurable. Includes pool-reset rollbacks (report.py labels it).
+    rollback_time: "float | None" = None
 
 
 @dataclass

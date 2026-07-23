@@ -27,6 +27,12 @@ def evaluate(run: RunSnapshot) -> "list[Finding]":
     if wall <= 0:
         return []
 
+    # One-time (calls==1) statements dominate a bounded run's clock but do NOT
+    # scale with input size. Exclude them to get a "variable" baseline against
+    # which a scaling N+1 cluster can be judged (R4-fix, below).
+    fixed_cost_time = sum(g.total_time for g in run.groups if g.calls == 1)
+    variable_wall = max(wall - fixed_cost_time, 1e-9)  # wall minus one-shot setup
+
     cpu_busy = (run.cpu_time / wall) if (run.cpu_time is not None and wall > 0) else None
 
     r1 = r1_group = None
@@ -132,17 +138,35 @@ def evaluate(run: RunSnapshot) -> "list[Finding]":
             continue  # single-group hotspots are R1's job, not R4's
         combined_calls = sum(g.calls for g in gs)
         combined_time = sum(g.total_time for g in gs)
-        if not (combined_calls > 1000 and combined_time > 0.10 * wall):
+        iterations = max(g.calls for g in gs)
+        per_iter = combined_calls / iterations if iterations else 0
+        # FIX R4: fire on SCALE, not just this run's wall%. A cluster that is a
+        # small share of the raw clock can still be the dominant cost at full
+        # volume: it may clear 10% once one-time setup is excluded, or it may be
+        # obviously per-iteration (>=200 iterations, >=3 queries each).
+        qualifies = combined_calls > 1000 and (
+            combined_time > 0.10 * wall                      # raw wall%
+            or combined_time > 0.10 * variable_wall          # setup-excluded wall%
+            or (iterations >= 200 and per_iter >= 3)         # absolute scale trigger
+        )
+        if not qualifies:
             continue
 
         gs_sorted = sorted(gs, key=lambda g: g.total_time, reverse=True)
         site_str = _site_str(gs_sorted[0])
+        excluded_pct = combined_time / variable_wall * 100
         detail_lines = [f"{len(gs_sorted)} query groups fire together from {site_str} in {site[2]}:"]
         for g in gs_sorted:
             detail_lines.append(f"  - {g.normalized_sql} ({g.calls:,} calls, {g.total_time:.1f}s)")
         detail_lines.append(
             f"combined: {combined_calls:,} calls, {combined_time:.1f}s "
-            f"= {combined_time / wall * 100:.0f}% of {wall:.1f}s wall."
+            f"= {combined_time / wall * 100:.0f}% of {wall:.1f}s wall "
+            f"({excluded_pct:.0f}% once {fixed_cost_time:.1f}s of one-time setup is excluded)."
+        )
+        detail_lines.append(
+            f"~= {per_iter:.1f} queries/iteration across ~{iterations:,} iterations from {site_str} "
+            f"-- this scales linearly with units, so it becomes the dominant cost at full "
+            f"volume even though it did not win this bounded run's clock."
         )
 
         # B2: honest per-iteration estimate, only when the signal is strong
@@ -173,6 +197,60 @@ def evaluate(run: RunSnapshot) -> "list[Finding]":
 
     if r1_absorbed:
         findings = [f for f in findings if f.rule != "R1"]
+
+    # --- R5: one-shot heavyweight statement -----------------------------------
+    # A single calls==1 statement over 15% of wall. Invisible to R1/R3/R4, which
+    # all assume chattiness. Independent & additive: never merged or suppressed
+    # against R1-R4; ranks in top-3 by seconds like any other finding.
+    try:
+        one_shots = [g for g in run.groups if g.calls == 1]
+        if one_shots:
+            g = max(one_shots, key=lambda x: x.total_time)
+            if g.total_time > 0.15 * wall:
+                where = _site_str(g) if g.call_site else g.normalized_sql
+                detail = (
+                    f"1 statement at {where} took {g.total_time:.1f}s "
+                    f"= {g.total_time / wall * 100:.0f}% of {wall:.1f}s wall.\n"
+                    f"It runs once regardless of input size, so R1/R3/R4 (which look for "
+                    f"chattiness) miss it -- but it is the single biggest fixed cost. "
+                    f"Cache, narrow, or stream it."
+                )
+                findings.append(
+                    Finding("R5", "One-shot heavyweight statement", detail, g.total_time)
+                )
+    except Exception:
+        pass
+
+    # --- R6: rising per-unit cost (unit-aware) --------------------------------
+    # Only when unit mode was on. Cost per unit climbing over the run is a strong
+    # "growing per-item work" signal that program-wide totals hide entirely.
+    try:
+        us = run.unit_stats
+    except AttributeError:
+        us = None
+    if us is not None:
+        try:
+            first = us.first_window_mean_duration
+            last = us.last_window_mean_duration
+            if (
+                us.count >= 20
+                and first is not None
+                and last is not None
+                and first > 0
+                and last >= 1.5 * first
+            ):
+                delta_pct = (last - first) / first * 100
+                detail = (
+                    f"first 100 units averaged {first * 1000:.0f} ms; "
+                    f"last 100 averaged {last * 1000:.0f} ms (+{delta_pct:.0f}%). "
+                    f"Cost per unit is climbing -- likely growing per-item work "
+                    f"(accumulating state, unbatched history reads, or a list that "
+                    f"grows each iteration)."
+                )
+                seconds = max(0.0, (us.mean_duration - first) * us.count)
+                findings.append(Finding("R6", "Rising per-unit cost", detail, seconds))
+        except Exception:
+            pass
 
     # suppress trivia, sort, cap at 3
     findings = [f for f in findings if f.seconds >= 0.05 * wall]

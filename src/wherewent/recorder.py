@@ -9,12 +9,19 @@ Design invariants (see build contract):
 """
 
 import atexit
+import collections
+import contextvars
 import functools
+import importlib.abc
+import importlib.util
+import inspect
 import json
 import os
+import random
 import signal
 import statistics
 import sys
+import sysconfig
 import threading
 import time
 from time import perf_counter
@@ -22,9 +29,172 @@ from time import perf_counter
 from . import callsite, report, rules
 from .callsite import capture_stack, get_async_site, resolve_call_site
 from .normalize import group_key, normalize_sql
-from .stats import GroupSnapshot, RunSnapshot
+from .stats import GroupSnapshot, RunSnapshot, UnitStats
 
 _NORM_CACHE_MAX = 4096
+# D1: bounded reservoir cap for per-GROUP duration medians (matches the
+# _UnitAccumulator cap). total_time stays exact; only the median is sampled.
+_DUR_RESERVOIR_CAP = 5000
+
+# ---------------------------------------------------------------------------
+# Unit-aware profiling (v0.3, --unit-function / wherewent.unit()).
+#
+# Two module-level ContextVars carry per-unit state. They are only ever TOUCHED
+# on the query hot path behind `if self._unit_enabled:`, so a run without
+# --unit-function/unit() pays zero extra cost (the v0.2 hot path is unchanged).
+# ---------------------------------------------------------------------------
+
+# The current unit's mutable record dict (or None when not inside a unit).
+_current_unit = contextvars.ContextVar("wherewent_current_unit", default=None)
+# Recursion depth: only the OUTERMOST wrapped call / context is a unit.
+_unit_depth = contextvars.ContextVar("wherewent_unit_depth", default=0)
+
+
+class _UnitAccumulator:
+    """Bounded-memory aggregator: never stores every unit (jobs may do millions).
+
+    Keeps exact running sums, a reservoir sample (cap 5000) for the medians, a
+    FIRST window (first 100 units) and a LAST window (deque of the last 100),
+    all bounded.
+    """
+
+    W = 100          # first-window size
+    CAP = 5000       # reservoir cap
+
+    def __init__(self):
+        self.count = 0
+        self.sum_duration = 0.0
+        self.sum_queries = 0
+        self.sum_commits = 0
+        self.sum_rollbacks = 0
+        self.sum_rows = 0
+        # reservoir samples (paired so a sampled unit contributes both figures)
+        self._res_dur = []
+        self._res_q = []
+        self._seen = 0
+        # FIRST window: count + sum_duration (+ sum_queries for the D4 slope)
+        self.first_n = 0
+        self.first_sum_duration = 0.0
+        self.first_sum_queries = 0
+        # LAST window: bounded rings of recent durations and query-counts
+        self.last_durations = collections.deque(maxlen=self.W)
+        self.last_queries = collections.deque(maxlen=self.W)
+
+    def add(self, duration, queries, commits, rollbacks, rows):
+        self.count += 1
+        self.sum_duration += duration
+        self.sum_queries += queries
+        self.sum_commits += commits
+        self.sum_rollbacks += rollbacks
+        self.sum_rows += rows
+
+        # reservoir sampling (algorithm R): exact while under the cap
+        self._seen += 1
+        if len(self._res_dur) < self.CAP:
+            self._res_dur.append(duration)
+            self._res_q.append(queries)
+        else:
+            j = random.randint(0, self._seen - 1)
+            if j < self.CAP:
+                self._res_dur[j] = duration
+                self._res_q[j] = queries
+
+        if self.first_n < self.W:
+            self.first_n += 1
+            self.first_sum_duration += duration
+            self.first_sum_queries += queries
+
+        self.last_durations.append(duration)
+        self.last_queries.append(queries)
+
+
+class _WrapLoader(importlib.abc.Loader):
+    """Delegates to the real loader, then runs a patch callback on the module."""
+
+    def __init__(self, inner, patch):
+        self.inner = inner
+        self.patch = patch
+
+    def create_module(self, spec):
+        return self.inner.create_module(spec)
+
+    def exec_module(self, module):
+        self.inner.exec_module(module)
+        try:
+            self.patch(module)
+        except Exception:
+            pass
+
+
+class _PostImportPatcher(importlib.abc.MetaPathFinder):
+    """meta_path finder: patches a specific module right after it is executed."""
+
+    def __init__(self, target_module, patch):
+        self.target_module = target_module
+        self.patch = patch
+        self._busy = False
+
+    def find_spec(self, name, path, target=None):
+        if name != self.target_module or self._busy:
+            return None
+        self._busy = True
+        try:
+            spec = importlib.util.find_spec(name)   # real spec, via other finders
+        except Exception:
+            spec = None
+        finally:
+            self._busy = False
+        if spec is None or spec.loader is None:
+            return None
+        spec.loader = _WrapLoader(spec.loader, self.patch)
+        return spec
+
+
+class _BareNamePatcher(importlib.abc.MetaPathFinder):
+    """meta_path finder for a bare function name: scans each user module that
+    finishes importing and patches the first top-level callable that matches."""
+
+    def __init__(self, patch, done):
+        self.patch = patch
+        self._done = done      # callable() -> bool, so we stop once wrapped
+        self._busy = False
+
+    def find_spec(self, name, path, target=None):
+        if self._busy or self._done():
+            return None
+        self._busy = True
+        try:
+            spec = importlib.util.find_spec(name)
+        except Exception:
+            spec = None
+        finally:
+            self._busy = False
+        if spec is None or spec.loader is None:
+            return None
+        if not _is_user_origin(getattr(spec, "origin", None)):
+            return None
+        spec.loader = _WrapLoader(spec.loader, self.patch)
+        return spec
+
+
+def _is_user_origin(origin):
+    """Best-effort: True for a user source file, False for stdlib/site-packages."""
+    if not origin or not isinstance(origin, str):
+        return False
+    if origin in ("built-in", "frozen", "namespace"):
+        return False
+    if "site-packages" in origin or "dist-packages" in origin:
+        return False
+    try:
+        stdlib = sysconfig.get_paths().get("stdlib", "")
+        platlib = sysconfig.get_paths().get("platstdlib", "")
+        if stdlib and origin.startswith(stdlib):
+            return False
+        if platlib and origin.startswith(platlib):
+            return False
+    except Exception:
+        pass
+    return True
 
 
 class Recorder:
@@ -54,9 +224,29 @@ class Recorder:
 
         self.commit_time = 0.0
         self.commit_measurable = False   # only True once a dialect is wrapped
+        # D2: rollback time is split out of commit_time. Both become measurable
+        # together (same dialect wrap), so rollback mirrors commit_measurable.
+        self.rollback_time = 0.0
 
         self.sqlalchemy_active = False
         self._prev_handlers = {}
+        self._listeners = []   # D10: (identifier, fn) pairs registered on Engine
+        self._wrapped_dialects = []  # D10: dialects whose commit/rollback we wrapped
+
+        # -- unit-aware profiling (v0.3) --------------------------------------
+        # All of this stays dormant (and the hot path unchanged) unless unit
+        # mode is enabled via --unit-function (WHEREWENT_UNIT_FUNCTION) or a
+        # first use of wherewent.unit().
+        self._unit_enabled = False        # THE gate for the query hot path
+        self._unit_spec = None            # SPEC string from --unit-function
+        self._unit_name = None            # first name seen via unit() context mgr
+        self._unit_wrapped = False        # True once a target was actually patched
+        self._unit_setup_done = False     # guard against double-wiring the wrapper
+        self._unit_acc = None             # _UnitAccumulator (lazily created)
+        self._unit_module = None          # module part of SPEC
+        self._unit_attr_path = None       # attr path: "func" or "Class.method"
+        self._unit_bare = False           # SPEC was a bare name (no module)
+        self._current_unit = _current_unit   # hot-path reads self._current_unit
 
     # -- installation ----------------------------------------------------------
 
@@ -83,6 +273,19 @@ class Recorder:
             event.listen(Engine, "commit", self._on_commit)
             event.listen(Engine, "rollback", self._on_rollback)
             event.listen(Engine, "engine_connect", self._on_connect)
+            # D3: a failed execute never fires after_cursor_execute, so its
+            # _exec_start entry would leak. handle_error pops it (best-effort).
+            event.listen(Engine, "handle_error", self._on_error)
+            # D10: remember what we registered so disable() can remove it.
+            self._listeners = [
+                ("before_cursor_execute", self._before),
+                ("after_cursor_execute", self._after),
+                ("begin", self._on_begin),
+                ("commit", self._on_commit),
+                ("rollback", self._on_rollback),
+                ("engine_connect", self._on_connect),
+                ("handle_error", self._on_error),
+            ]
             self.sqlalchemy_active = True
         except Exception:
             self.sqlalchemy_active = False
@@ -91,9 +294,64 @@ class Recorder:
         # user-entry coroutine methods so they stamp the call-site contextvar.
         self._install_async_wrappers()
 
+        # v0.3: wire the --unit-function wrapper (if a SPEC was supplied). This
+        # is fully guarded — an unresolvable target leaves the job running.
+        if self._unit_enabled and self._unit_spec and not self._unit_setup_done:
+            try:
+                self._setup_unit_wrapping()
+            except Exception:
+                pass
+
         atexit.register(self.finalize)
         self._install_signal_handlers()
         self._start_interval_thread()
+
+    def disable(self):
+        """D10: best-effort teardown of the process-global hooks this recorder
+        installed. Fully guarded — never raises. Does NOT reset accumulated
+        counters (a caller may still want snapshot()). Idempotent.
+
+        Removes the Engine class-level event listeners and restores any dialect
+        commit/rollback wrappers we own. Existing behavior is unchanged when
+        disable() is never called.
+        """
+        try:
+            self._unit_enabled = False
+            self.installed = False
+        except Exception:
+            pass
+        # remove the SQLAlchemy event listeners we registered
+        try:
+            from sqlalchemy import event
+            from sqlalchemy.engine import Engine
+            for identifier, fn in list(getattr(self, "_listeners", [])):
+                try:
+                    event.remove(Engine, identifier, fn)
+                except Exception:
+                    pass
+        except Exception:
+            pass
+        finally:
+            self._listeners = []
+        # restore wrapped dialect commit/rollback if feasible (idempotent)
+        for dialect in list(getattr(self, "_wrapped_dialects", [])):
+            try:
+                orig_commit = getattr(dialect, "_wherewent_orig_commit", None)
+                orig_rollback = getattr(dialect, "_wherewent_orig_rollback", None)
+                if orig_commit is not None:
+                    dialect.do_commit = orig_commit
+                if orig_rollback is not None:
+                    dialect.do_rollback = orig_rollback
+                try:
+                    dialect._wherewent_wrapped = False
+                except Exception:
+                    pass
+            except Exception:
+                pass
+        try:
+            self._wrapped_dialects = []
+        except Exception:
+            pass
 
     # -- async call-site wrappers (A1) -----------------------------------------
 
@@ -228,13 +486,24 @@ class Recorder:
             self.total_queries += 1
             self.db_time += duration
 
+            # v0.3 per-unit attribution. When unit mode is DISABLED this is a
+            # single bool check evaluating to None — no contextvar touch, so the
+            # v0.2 hot path is unchanged. When enabled, `u` is the current unit
+            # record (or None outside any unit) and we count this query + rows.
+            u = self._current_unit.get() if self._unit_enabled else None
+            if u is not None:
+                u["queries"] += 1
+
             key, normalized = self._normalize_cached(statement)
             g = self.groups.get(key)
             if g is None:
                 g = {
                     "normalized_sql": normalized,
                     "calls": 0,
-                    "durations": [],
+                    # D1: bounded reservoir for the MEDIAN only (cap 5000). The
+                    # count (`calls`) and `total_time` stay EXACT.
+                    "dur_reservoir": [],
+                    "dur_seen": 0,
                     "total_time": 0.0,
                     "rows": 0,
                     "executemany_calls": 0,
@@ -244,8 +513,17 @@ class Recorder:
                 self.groups[key] = g
 
             g["calls"] += 1
-            g["durations"].append(duration)
             g["total_time"] += duration
+            # D1: reservoir sampling (algorithm R) — exact under the cap, then
+            # random replacement above it, so per-group memory is O(cap).
+            g["dur_seen"] += 1
+            res = g["dur_reservoir"]
+            if len(res) < _DUR_RESERVOIR_CAP:
+                res.append(duration)
+            else:
+                j = random.randint(0, g["dur_seen"] - 1)
+                if j < _DUR_RESERVOIR_CAP:
+                    res[j] = duration
             if executemany:
                 g["executemany_calls"] += 1
 
@@ -254,6 +532,8 @@ class Recorder:
                 if rc is not None and rc >= 0:
                     g["rows"] += rc
                     self.total_rows += rc
+                    if u is not None:
+                        u["rows"] += rc
             except Exception:
                 pass
 
@@ -269,6 +549,20 @@ class Recorder:
             # full stack capture only for the first 5 executions per group
             if g["calls"] <= 5:
                 g["sample_stacks"].append(capture_stack())
+        except Exception:
+            pass
+        finally:
+            self.overhead_time += perf_counter() - t0
+
+    def _on_error(self, exception_context):
+        # D3: a failed execute skips after_cursor_execute, leaking _exec_start.
+        # Clean up the entry for the failing context. Do NOT touch the
+        # exception — SQLAlchemy re-raises; we just return None.
+        t0 = perf_counter()
+        try:
+            ctx = getattr(exception_context, "execution_context", None)
+            if ctx is not None:
+                self._exec_start.pop(id(ctx), None)
         except Exception:
             pass
         finally:
@@ -290,6 +584,10 @@ class Recorder:
         try:
             self.total_commits += 1
             self._txn_gen[id(conn)] = self._txn_gen.get(id(conn), 0) + 1
+            if self._unit_enabled:
+                u = self._current_unit.get()
+                if u is not None:
+                    u["commits"] += 1
         except Exception:
             pass
         finally:
@@ -300,6 +598,10 @@ class Recorder:
         try:
             self.total_rollbacks += 1
             self._txn_gen[id(conn)] = self._txn_gen.get(id(conn), 0) + 1
+            if self._unit_enabled:
+                u = self._current_unit.get()
+                if u is not None:
+                    u["rollbacks"] += 1
         except Exception:
             pass
         finally:
@@ -341,14 +643,281 @@ class Recorder:
                 return _orig(dbapi_connection)
             finally:
                 try:
-                    rec.commit_time += perf_counter() - t
+                    # D2: rollback time is its OWN bucket, not commit_time. The
+                    # pool fires do_rollback as a reset on checkin, so this
+                    # includes pool resets (report.py labels it accordingly).
+                    rec.rollback_time += perf_counter() - t
                 except Exception:
                     pass
 
         dialect.do_commit = timed_commit
         dialect.do_rollback = timed_rollback
         dialect._wherewent_wrapped = True
+        # D10: stash originals so disable() can restore this dialect.
+        try:
+            dialect._wherewent_orig_commit = orig_commit
+            dialect._wherewent_orig_rollback = orig_rollback
+            self._wrapped_dialects.append(dialect)
+        except Exception:
+            pass
         self.commit_measurable = True
+
+    # -- unit-aware profiling (v0.3) -------------------------------------------
+
+    def enable_unit(self, spec):
+        """Enable unit mode from a --unit-function SPEC (WHEREWENT_UNIT_FUNCTION).
+
+        Idempotent; safe before or after install(). Fully guarded so a bad SPEC
+        never affects the host job.
+        """
+        try:
+            self._unit_spec = spec or None
+            self._unit_enabled = True
+            if self._unit_acc is None:
+                self._unit_acc = _UnitAccumulator()
+            if self.installed and self._unit_spec and not self._unit_setup_done:
+                self._setup_unit_wrapping()
+        except Exception:
+            pass
+
+    def _ensure_unit_mode(self, name):
+        """Lazily enable unit mode from a wherewent.unit() context manager use.
+
+        No SPEC / no target wrapping — the context manager IS the entry point.
+        """
+        if self._unit_acc is None:
+            self._unit_acc = _UnitAccumulator()
+        self._unit_enabled = True
+        if self._unit_spec is None and self._unit_name is None:
+            self._unit_name = name
+
+    def _unit_note(self, what):
+        # Honesty: tell the user (stderr) exactly what got wrapped as a unit.
+        try:
+            sys.stderr.write(f"wherewent: wrapping unit function -> {what}\n")
+            sys.stderr.flush()
+        except Exception:
+            pass
+
+    def _setup_unit_wrapping(self):
+        """Parse the SPEC and arrange for the target callable to be wrapped.
+
+        `pkg.mod:func` / `pkg.mod:Class.method`: patch immediately if the module
+        is already imported (incl. __main__), else install a post-import finder.
+        Bare `func`: scan already-loaded user modules, and install a finder for
+        modules that load later. All guarded — an unresolvable target simply
+        leaves `wrapped=False`.
+        """
+        self._unit_setup_done = True
+        spec = self._unit_spec or ""
+        if ":" in spec:
+            mod, attr = spec.split(":", 1)
+            self._unit_module = mod.strip()
+            self._unit_attr_path = attr.strip()
+            self._unit_bare = False
+            existing = sys.modules.get(self._unit_module)
+            if existing is not None:
+                self._patch_module_attr(existing)
+            if not self._unit_wrapped:
+                try:
+                    sys.meta_path.insert(
+                        0, _PostImportPatcher(self._unit_module, self._patch_module_attr)
+                    )
+                except Exception:
+                    pass
+        else:
+            self._unit_bare = True
+            self._unit_attr_path = spec.strip()
+            self._unit_module = None
+            # scan already-loaded user modules first (incl. __main__ if present)
+            for module in list(sys.modules.values()):
+                if self._unit_wrapped:
+                    break
+                try:
+                    self._patch_bare(module)
+                except Exception:
+                    pass
+            if not self._unit_wrapped:
+                try:
+                    sys.meta_path.insert(
+                        0, _BareNamePatcher(self._patch_bare, lambda: self._unit_wrapped)
+                    )
+                except Exception:
+                    pass
+
+    def _patch_module_attr(self, module):
+        """Wrap the SPEC's `func` or `Class.method` on an imported module."""
+        if self._unit_wrapped:
+            return
+        try:
+            parts = (self._unit_attr_path or "").split(".")
+            if len(parts) == 1:
+                name = parts[0]
+                orig = getattr(module, name, None)
+                if orig is None or not callable(orig):
+                    return
+                wrapped = self._make_unit_wrapper(orig)
+                if wrapped is not orig:
+                    setattr(module, name, wrapped)
+            elif len(parts) == 2:
+                cls = getattr(module, parts[0], None)
+                if cls is None:
+                    return
+                orig = getattr(cls, parts[1], None)
+                if orig is None or not callable(orig):
+                    return
+                wrapped = self._make_unit_wrapper(orig)
+                if wrapped is not orig:
+                    setattr(cls, parts[1], wrapped)
+            else:
+                return
+            self._unit_wrapped = True
+            self._unit_note(self._unit_spec)
+        except Exception:
+            pass
+
+    def _patch_bare(self, module):
+        """Best-effort: wrap the first top-level callable in `module` whose
+        __name__ matches the bare SPEC and which was defined in that module."""
+        if self._unit_wrapped:
+            return
+        try:
+            mod_name = getattr(module, "__name__", None)
+            origin = getattr(module, "__file__", None)
+            if mod_name != "__main__" and not _is_user_origin(origin):
+                return
+            name = self._unit_attr_path
+            obj = getattr(module, "__dict__", {}).get(name)
+            if obj is None or not callable(obj):
+                return
+            if getattr(obj, "__module__", None) != mod_name:
+                return
+            wrapped = self._make_unit_wrapper(obj)
+            if wrapped is not obj:
+                setattr(module, name, wrapped)
+            self._unit_wrapped = True
+            self._unit_note(f"{name} (in {mod_name})")
+        except Exception:
+            pass
+
+    def _make_unit_wrapper(self, orig):
+        """Return a wrapper making each OUTERMOST call one unit. Handles sync and
+        coroutine callables; idempotent via a `_wherewent_unit_wrapped` marker."""
+        if getattr(orig, "_wherewent_unit_wrapped", False):
+            return orig
+        rec = self
+
+        @functools.wraps(orig)
+        def wrapper(*args, **kwargs):
+            try:
+                depth = _unit_depth.get()
+            except Exception:
+                depth = 0
+            if depth > 0:
+                # nested self-call: NOT a new unit (outermost wins)
+                return orig(*args, **kwargs)
+            rec_dict, dtok, utok = rec._unit_begin()
+            try:
+                result = orig(*args, **kwargs)
+            except BaseException:
+                rec._unit_end(rec_dict, dtok, utok)
+                raise
+            if inspect.isawaitable(result):
+                # coroutine/awaitable: account after it is awaited
+                return rec._unit_await(result, rec_dict, dtok, utok)
+            rec._unit_end(rec_dict, dtok, utok)
+            return result
+
+        wrapper._wherewent_unit_wrapped = True
+        return wrapper
+
+    def _unit_begin(self):
+        rec_dict = {
+            "queries": 0, "commits": 0, "rollbacks": 0, "rows": 0,
+            "t0": perf_counter(),
+        }
+        dtok = _unit_depth.set(1)
+        utok = _current_unit.set(rec_dict)
+        return rec_dict, dtok, utok
+
+    def _unit_end(self, rec_dict, dtok, utok):
+        try:
+            duration = perf_counter() - rec_dict["t0"]
+            if self._unit_acc is not None:
+                self._unit_acc.add(
+                    duration,
+                    rec_dict["queries"], rec_dict["commits"],
+                    rec_dict["rollbacks"], rec_dict["rows"],
+                )
+        except Exception:
+            pass
+        finally:
+            try:
+                _current_unit.reset(utok)
+            except Exception:
+                pass
+            try:
+                _unit_depth.reset(dtok)
+            except Exception:
+                pass
+
+    async def _unit_await(self, awaitable, rec_dict, dtok, utok):
+        try:
+            return await awaitable
+        finally:
+            self._unit_end(rec_dict, dtok, utok)
+
+    def _build_unit_stats(self):
+        """Build a UnitStats from the accumulator. Even at count==0 we report
+        (so an unwrapped / never-called target is honest about `wrapped`)."""
+        name = self._unit_spec or self._unit_name or "unit"
+        acc = self._unit_acc
+        # `wrapped` is honest: a target was patched, OR units actually ran (the
+        # context-manager path has no target but clearly captured units).
+        wrapped = bool(self._unit_wrapped) or (acc is not None and acc.count > 0)
+
+        if acc is None or acc.count == 0:
+            return UnitStats(
+                name=name, wrapped=wrapped, count=0,
+                median_duration=0.0, mean_duration=0.0,
+                median_queries=0.0, mean_queries=0.0,
+                mean_commits=0.0, mean_rollbacks=0.0, mean_rows=0.0,
+                first_window_n=0, first_window_mean_duration=None,
+                last_window_n=0, last_window_mean_duration=None,
+                first_window_mean_queries=None,
+                last_window_mean_queries=None,
+            )
+
+        n = acc.count
+        median_dur = statistics.median(acc._res_dur) if acc._res_dur else 0.0
+        median_q = statistics.median(acc._res_q) if acc._res_q else 0.0
+        first_mean = (acc.first_sum_duration / acc.first_n) if acc.first_n else None
+        last_mean = (
+            (sum(acc.last_durations) / len(acc.last_durations))
+            if acc.last_durations else None
+        )
+        # D4: query-slope windows (enables R6 queries/unit slope).
+        first_mean_q = (acc.first_sum_queries / acc.first_n) if acc.first_n else None
+        last_mean_q = (
+            (sum(acc.last_queries) / len(acc.last_queries))
+            if acc.last_queries else None
+        )
+        return UnitStats(
+            name=name, wrapped=wrapped, count=n,
+            median_duration=median_dur,
+            mean_duration=acc.sum_duration / n,
+            median_queries=median_q,
+            mean_queries=acc.sum_queries / n,
+            mean_commits=acc.sum_commits / n,
+            mean_rollbacks=acc.sum_rollbacks / n,
+            mean_rows=acc.sum_rows / n,
+            first_window_n=acc.first_n,
+            first_window_mean_duration=first_mean,
+            last_window_n=len(acc.last_durations),
+            last_window_mean_duration=last_mean,
+            first_window_mean_queries=first_mean_q,
+            last_window_mean_queries=last_mean_q,
+        )
 
     # -- normalization cache ---------------------------------------------------
 
@@ -380,8 +949,9 @@ class Recorder:
 
         groups = []
         for key, g in self.groups.items():
-            durations = g["durations"]
-            median = statistics.median(durations) if durations else 0.0
+            # D1: sample median from the bounded reservoir (total_time is exact).
+            res = g["dur_reservoir"]
+            median = statistics.median(res) if res else 0.0
             site = None
             if g["call_sites"]:
                 site = max(g["call_sites"].items(), key=lambda kv: kv[1])[0]
@@ -399,6 +969,10 @@ class Recorder:
             )
 
         commit_time = self.commit_time if self.commit_measurable else None
+        # D2: rollback becomes measurable together with commit (same wrap).
+        rollback_time = self.rollback_time if self.commit_measurable else None
+
+        unit_stats = self._build_unit_stats() if self._unit_enabled else None
 
         return RunSnapshot(
             wall_time=wall,
@@ -412,6 +986,8 @@ class Recorder:
             overhead_time=self.overhead_time,
             sqlalchemy_active=self.sqlalchemy_active,
             groups=groups,
+            unit_stats=unit_stats,
+            rollback_time=rollback_time,
         )
 
     def peek(self, reason="signal"):
@@ -479,6 +1055,7 @@ class Recorder:
             "total_commits": run.total_commits,
             "total_rollbacks": run.total_rollbacks,
             "commit_time": run.commit_time,
+            "rollback_time": run.rollback_time,
             "total_rows": run.total_rows,
             "db_time": run.db_time,
             "overhead_time": run.overhead_time,
@@ -488,6 +1065,7 @@ class Recorder:
                 {"rule": f.rule, "title": f.title, "detail": f.detail, "seconds": f.seconds}
                 for f in findings
             ],
+            "unit_stats": _unit_stats_to_json(run.unit_stats),
         }
         try:
             with open(self.save_path, "w") as fh:
@@ -496,11 +1074,114 @@ class Recorder:
             pass
 
 
+def _unit_stats_to_json(us):
+    """Serialize a UnitStats (or None) for the --save payload."""
+    if us is None:
+        return None
+    return {
+        "name": us.name,
+        "wrapped": us.wrapped,
+        "count": us.count,
+        "median_duration": us.median_duration,
+        "mean_duration": us.mean_duration,
+        "median_queries": us.median_queries,
+        "mean_queries": us.mean_queries,
+        "mean_commits": us.mean_commits,
+        "mean_rollbacks": us.mean_rollbacks,
+        "mean_rows": us.mean_rows,
+        "first_window_n": us.first_window_n,
+        "first_window_mean_duration": us.first_window_mean_duration,
+        "last_window_n": us.last_window_n,
+        "last_window_mean_duration": us.last_window_mean_duration,
+        "first_window_mean_queries": us.first_window_mean_queries,
+        "last_window_mean_queries": us.last_window_mean_queries,
+    }
+
+
 # module-level singleton
 recorder = Recorder()
 
 
+class unit:
+    """Context manager marking one unit of work — the in-code twin of
+    --unit-function. Shares the SAME contextvar/accumulator/recursion guard.
+
+    Usage::
+
+        with wherewent.unit("receivable"):
+            process(receivable)
+
+    Behavior:
+      * Records duration + per-unit query/commit/rollback/row counts on exit,
+        EVEN IF the body raised (then re-raises — never swallows).
+      * Respects the recursion-depth guard: a unit() inside a --unit-function
+        unit (or a nested unit()) does NOT double-count; the outermost wins.
+      * A safe **no-op that still runs the body** when the recorder is not
+        installed, so code using it is production-safe without wherewent.
+
+    Sync-only (a sync `with` inside an async loop body is sufficient for v0.3).
+    """
+
+    def __init__(self, name="unit"):
+        self.name = name
+        self._active = False
+        self._rec_dict = None
+        self._dtok = None
+        self._utok = None
+
+    def __enter__(self):
+        rec = recorder
+        try:
+            if not rec.installed:
+                return self  # no-op, but the body still runs
+            try:
+                depth = _unit_depth.get()
+            except Exception:
+                depth = 0
+            if depth > 0:
+                return self  # nested: outermost wins, this one is a no-op
+            rec._ensure_unit_mode(self.name)
+            self._rec_dict = {
+                "queries": 0, "commits": 0, "rollbacks": 0, "rows": 0,
+                "t0": perf_counter(),
+            }
+            self._dtok = _unit_depth.set(1)
+            self._utok = _current_unit.set(self._rec_dict)
+            self._active = True
+        except Exception:
+            self._active = False
+        return self
+
+    def __exit__(self, exc_type, exc, tb):
+        if self._active:
+            try:
+                duration = perf_counter() - self._rec_dict["t0"]
+                acc = recorder._unit_acc
+                if acc is not None:
+                    acc.add(
+                        duration,
+                        self._rec_dict["queries"], self._rec_dict["commits"],
+                        self._rec_dict["rollbacks"], self._rec_dict["rows"],
+                    )
+            except Exception:
+                pass
+            finally:
+                try:
+                    _current_unit.reset(self._utok)
+                except Exception:
+                    pass
+                try:
+                    _unit_depth.reset(self._dtok)
+                except Exception:
+                    pass
+        return False  # never suppress the body's exception
+
+
 def install_from_env() -> None:
-    """Entry point called by the shim: install using WHEREWENT_SAVE from env."""
+    """Entry point called by the shim: install using WHEREWENT_SAVE from env,
+    and enable unit mode from WHEREWENT_UNIT_FUNCTION when set."""
     save = os.environ.get("WHEREWENT_SAVE") or None
+    spec = os.environ.get("WHEREWENT_UNIT_FUNCTION") or None
+    if spec:
+        recorder.enable_unit(spec)
     recorder.install(save)

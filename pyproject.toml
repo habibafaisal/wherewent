@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "wherewent"
-version = "0.2.0"
+version = "0.3.0"
 description = "Zero-config SQL flight recorder that answers 'why did this Python batch job take so long?'"
 readme = "README.md"
 requires-python = ">=3.10"

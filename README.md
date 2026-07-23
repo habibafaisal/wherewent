@@ -107,6 +107,42 @@ wherewent run python demo/naive_job.py     # watch the R1+R2 finding fire
 python demo/benchmark.py                    # naive vs fixed, with the overhead gate
 ```
 
+## Name your unit of work
+
+"81,749 queries" is hard to judge. **"135 queries per receivable"** tells an engineer
+instantly that the architecture is chatty. Name the unit your job processes and wherewent
+reports the economics of *one* — median duration, queries/commits/rows per unit, and how
+the cost trends as the run progresses:
+
+```bash
+# Zero-config: name a function; every top-level call is one unit
+wherewent run --unit-function myapp.jobs:process_receivable python run.py
+```
+
+```python
+# Or mark the unit in code (same machinery, same report)
+import wherewent
+for receivable in book:
+    with wherewent.unit("receivable"):
+        process(receivable)
+```
+
+```
+UNIT: myapp.jobs:process_receivable   (1,203 units)
+----------------------------------------------------------------------------------------------------
+  median duration     341 ms         queries/unit    135 (median)
+  commits/unit        1.0            rows/unit        46.0
+  GROWTH
+    units 1–100          220 ms/unit
+    units (last 100)     379 ms/unit
+    trend                +72% slower over the run     ← R6 fires
+```
+
+The growth trend is why a *sampled* run is honest: it shows cost-per-unit **rising**, so you
+know the full run will be worse than a linear extrapolation — the thing a totals-only profiler
+can never tell you. Per-unit counts are exact even under concurrent async units; nothing but
+shapes and counts is ever recorded.
+
 ## How it works
 
 1. **Injects itself** into the target process via a `PYTHONPATH` sitecustomize shim — no
@@ -127,12 +163,15 @@ python demo/benchmark.py                    # naive vs fixed, with the overhead 
 | **R1 — chatty group** | > 1,000 calls, > 10% of wall, median < 5ms | A fast query is called too many times — batch it (`executemany` / `IN`-list / `JOIN`). |
 | **R2 — commit-per-row** | > 100 commits, < 10 rows/commit, > 5% of wall in commit | You're committing per row — batch to 1,000+ rows per transaction. |
 | **R3 — DB-wait bound** | in-DB time > 60% of wall, CPU busy < 30% | The job is round-trip bound, not compute bound. |
-| **R4 — co-occurring pattern** | ≥ 2 query groups share a call site, > 1,000 combined calls, > 10% of wall | Several queries fire together every iteration — collapse them into one round-trip. Reports an estimated *queries-per-iteration*. |
+| **R4 — co-occurring pattern** | ≥ 2 query groups share a call site AND the pattern **scales** — many queries/iteration across many iterations, *or* > 10% of wall once one-time setup is excluded | Several queries fire together every iteration (SELECT + UPDATE + INSERT) — collapse them into one round-trip. Reports estimated *queries-per-iteration*, and flags patterns that scale even when a bounded run's clock hides them. |
+| **R5 — one-shot heavyweight** | a single `calls==1` statement > 15% of wall | One statement is a huge fixed cost. R1/R3/R4 all look for chattiness and miss it — R5 catches the single most fixable line. |
+| **R6 — rising per-unit cost** | per-unit time climbs ≥ 1.5× from the first 100 units to the last 100 (needs `--unit-function`/`wherewent.unit()`) | Cost per item grows as the run progresses — accumulating state, unbatched history reads, or a list that grows each loop. |
 
 Findings that share a root cause **merge** (e.g. `R1+R2`), everything under 5% of wall is
 suppressed, and at most the top 3 are shown — ranked by seconds attributable. **R4** catches
 the case a per-group threshold can't: an N+1 pattern spread across a SELECT + UPDATE + INSERT
-that individually look innocent but fire as one unit each loop.
+that individually look innocent but fire as one unit each loop — and, since v0.3, it fires on
+patterns that **scale** even when one-time setup costs make them look small on a short sample run.
 
 **Every number is honest.** Query times are labelled *app-observed* (they include network,
 driver, and server time — not just Postgres). Anything that can't be measured prints `—`,
@@ -151,11 +190,27 @@ start/end/rowcount/txn events from another driver, feed the same `RunSnapshot`, 
 entire findings-and-report pipeline works for free. Good first backends:
 
 - [x] **Async SQLAlchemy** — call-site attribution through the greenlet boundary *(v0.2.0)*
+- [x] **Work-unit-aware profiling** — per-unit economics + growth trend *(v0.3.0)*
+- [ ] **Execution-pattern findings** *(the next big one — help wanted)* — today wherewent
+  clusters the queries that fire together each iteration (R4). Next: **reconstruct the ordered,
+  possibly nested workflow** behind them and name it, e.g.
+  ```
+  For each receivable:
+    For each audit event ×23:
+      SELECT chain_state → SELECT payload → INSERT payload → INSERT audit_event → UPDATE chain_state
+  Finding: serialized audit-append loop — 23 repetitions/receivable, ≈115 statements/receivable,
+           58% of DB activity, at process_receivable → emit_firing → append_event.
+  ```
+  This is a real step past ordinary N+1 detection (Sentry/Scout find repeated single-shape
+  queries; this would find multi-operation workflows spanning several SQL shapes and functions):
+  read→modify→write loops, serialize→insert→commit per item, whole-state snapshots after every
+  mutation, growing-history scans, and CPU rising with item position. Needs an ordered per-unit
+  event log + repeated-subsequence mining, kept under the overhead gate.
 - [ ] **Raw `psycopg` / `psycopg2`** — cursor subclass or connection factory hook
 - [ ] **Raw `asyncpg`** (outside SQLAlchemy) — the async execution path
 - [ ] **Django ORM** — via `connection.execute_wrapper`
 - [ ] **Generic DB-API 2.0** — a monkeypatch-free `Cursor` proxy
-- [ ] New findings rules (N+1 `SELECT` detection, lock-wait, seq-scan heuristics)
+- [ ] More findings rules (lock-wait, seq-scan heuristics)
 
 See [`CONTRIBUTING.md`](CONTRIBUTING.md) for the backend contract and the **< 15% overhead
 gate** that every capture path must pass.
@@ -169,6 +224,9 @@ gate** that every capture path must pass.
 - Commit timing is obtained by wrapping the dialect's commit; if that wrap fails it prints `—`.
 - Per-iteration ratios are **estimates** (labelled `≈`) inferred from co-occurring query
   counts — shown only when the signal is strong, never guessed.
+- Per-unit **counts** (`--unit-function` / `wherewent.unit()`) are exact even under concurrent
+  async units; per-unit **duration** is wall time and may overlap when units run concurrently —
+  the common sequential-loop case is exact.
 
 These are the honest edges of a validation prototype, not permanent walls — see the roadmap.
 

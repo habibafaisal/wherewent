@@ -11,9 +11,10 @@ import subprocess
 import sys
 
 USAGE = (
-    "usage: wherewent run [--save PATH] <command...>\n"
+    "usage: wherewent run [--save PATH] [--unit-function SPEC] <command...>\n"
     "  e.g. wherewent run python job.py\n"
     "       wherewent run --save out.json python -m mypkg\n"
+    "       wherewent run --unit-function myapp.jobs:process_receivable python run.py\n"
     "       wherewent run job.py            (bare script uses this interpreter)\n"
 )
 
@@ -22,7 +23,7 @@ def _usage():
     sys.stderr.write(USAGE)
 
 
-def _child_env(save):
+def _child_env(save, unit_function=None):
     import wherewent
     import wherewent._shim as shim
 
@@ -39,6 +40,7 @@ def _child_env(save):
     env["PYTHONPATH"] = os.pathsep.join(parts)
     env["WHEREWENT_ACTIVE"] = "1"
     env["WHEREWENT_SAVE"] = save or ""
+    env["WHEREWENT_UNIT_FUNCTION"] = unit_function or ""
     return env
 
 
@@ -50,6 +52,7 @@ def main(argv=None):
 
     args = argv[1:]
     save = None
+    unit_function = None
     i = 0
     while i < len(args):
         a = args[i]
@@ -58,6 +61,13 @@ def main(argv=None):
                 _usage()
                 return 2
             save = args[i + 1]
+            i += 2
+            continue
+        if a == "--unit-function":
+            if i + 1 >= len(args):
+                _usage()
+                return 2
+            unit_function = args[i + 1]
             i += 2
             continue
         break  # first non-option token starts the command
@@ -71,7 +81,7 @@ def main(argv=None):
     if command[0].endswith(".py"):
         command = [sys.executable] + command
 
-    env = _child_env(save)
+    env = _child_env(save, unit_function)
 
     # While the child runs, the parent ignores Ctrl-C so the SIGINT goes to the
     # child (which finalizes and prints the report); we exit with its code.
