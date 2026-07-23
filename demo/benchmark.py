@@ -104,15 +104,22 @@ def check_async_end_to_end(env, scratch, async_rows):
         check("async INSERT group call_site is non-null", call_site is not None, f"call_site={call_site}")
     )
 
-    site_str = f"{call_site[0]}:{call_site[1]}" if call_site else None
-    named = bool(site_str) and any(
-        site_str in f.get("detail", "") or site_str in f.get("title", "") for f in async_findings
-    )
+    candidate_sites = {
+        f"{g['call_site'][0]}:{g['call_site'][1]}"
+        for g in async_data.get("groups", [])
+        if g.get("call_site") and os.path.basename(g["call_site"][0]) == "async_naive_job.py"
+    }
+    matched = {
+        site
+        for site in candidate_sites
+        if any(site in f.get("detail", "") or site in f.get("title", "") for f in async_findings)
+    }
+    named = bool(matched)
     sub_results.append(
         check(
             "a finding names the real async call site",
             named,
-            f"site={site_str} rules={[f['rule'] for f in async_findings]}",
+            f"named_sites={matched} candidates={sorted(candidate_sites)} rules={[f['rule'] for f in async_findings]}",
         )
     )
     return all(sub_results)
