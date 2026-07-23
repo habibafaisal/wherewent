@@ -1,0 +1,33 @@
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+*.egg
+build/
+dist/
+.eggs/
+
+# Virtualenvs
+.venv/
+venv/
+env/
+
+# Test / tooling caches
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.coverage
+htmlcov/
+
+# wherewent runtime artifacts
+*.json.wherewent
+demo_events.db
+demo/*.db
+naive.json
+fixed.json
+
+# OS / editor
+.DS_Store
+*.swp
+.idea/
+.vscode/

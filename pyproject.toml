@@ -1,0 +1,58 @@
+[build-system]
+requires = ["setuptools>=77"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "wherewent"
+version = "0.1.0"
+description = "Zero-config SQL flight recorder that answers 'why did this Python batch job take so long?'"
+readme = "README.md"
+requires-python = ">=3.10"
+license = "MIT"
+license-files = ["LICENSE"]
+authors = [{ name = "Habiba Faisal", email = "habibafaisal8@gmail.com" }]
+keywords = [
+    "profiling",
+    "performance",
+    "sqlalchemy",
+    "postgresql",
+    "sql",
+    "observability",
+    "batch",
+    "n+1",
+    "orm",
+]
+classifiers = [
+    "Development Status :: 3 - Alpha",
+    "Intended Audience :: Developers",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.10",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+    "Programming Language :: Python :: 3.13",
+    "Topic :: Database",
+    "Topic :: Software Development :: Debuggers",
+    "Topic :: System :: Monitoring",
+    "Environment :: Console",
+    "Operating System :: OS Independent",
+]
+# The recorder itself is pure stdlib; SQLAlchemy is only needed by the job you record.
+dependencies = []
+
+[project.urls]
+Homepage = "https://github.com/habibafaisal/wherewent"
+Repository = "https://github.com/habibafaisal/wherewent"
+Issues = "https://github.com/habibafaisal/wherewent/issues"
+Changelog = "https://github.com/habibafaisal/wherewent/blob/main/CHANGELOG.md"
+
+[project.scripts]
+wherewent = "wherewent.cli:main"
+
+[project.optional-dependencies]
+# Optional CPU-accounting backend; the recorder falls back to os.times() without it.
+psutil = ["psutil"]
+# Everything needed to run the test suite and the demo benchmark.
+dev = ["pytest", "sqlalchemy>=2.0"]
+
+[tool.setuptools.packages.find]
+where = ["src"]
