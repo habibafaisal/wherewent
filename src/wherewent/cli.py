@@ -76,6 +76,14 @@ def main(argv=None):
     # While the child runs, the parent ignores Ctrl-C so the SIGINT goes to the
     # child (which finalizes and prints the report); we exit with its code.
     prev = signal.signal(signal.SIGINT, signal.SIG_IGN)
+    # A4: also ignore SIGUSR1 in the parent so signalling the whole process group
+    # (kill -USR1 -<pgid>) prints the child's PARTIAL SNAPSHOT without killing us.
+    prev_usr1 = None
+    if hasattr(signal, "SIGUSR1"):
+        try:
+            prev_usr1 = signal.signal(signal.SIGUSR1, signal.SIG_IGN)
+        except Exception:
+            prev_usr1 = None
     try:
         proc = subprocess.run(command, env=env)
     except FileNotFoundError:
@@ -83,6 +91,11 @@ def main(argv=None):
         return 127
     finally:
         signal.signal(signal.SIGINT, prev)
+        if prev_usr1 is not None:
+            try:
+                signal.signal(signal.SIGUSR1, prev_usr1)
+            except Exception:
+                pass
     return proc.returncode
 
 

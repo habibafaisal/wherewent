@@ -88,6 +88,11 @@ wherewent run --save run.json python your_job.py   # also dump machine-readable 
 - The report prints to **stderr** at exit; your job's own stdout/stderr pass through untouched.
 - **Ctrl-C still produces a report.** Sampling the first 5 minutes of a 14-hour job is the
   main use case — partial data is the point.
+- **Peek without stopping.** Send `SIGUSR1` (`kill -USR1 <pid>`) for a partial snapshot mid-run,
+  or run with `WHEREWENT_INTERVAL=30` to print one every 30s. The job keeps going.
+- **Works on async SQLAlchemy.** Queries run inside a greenlet with no user frames on the
+  stack, so naive stack-walking blames nothing; wherewent attributes them to your real call
+  site anyway (`AsyncSession` / `AsyncConnection`).
 - **It can never crash or corrupt your job.** Every hook body is wrapped so the recorder
   fails silent rather than taking your run down with it.
 - **It never records your data.** Only query *shapes* and *counts* are kept — literal
@@ -122,9 +127,12 @@ python demo/benchmark.py                    # naive vs fixed, with the overhead 
 | **R1 — chatty group** | > 1,000 calls, > 10% of wall, median < 5ms | A fast query is called too many times — batch it (`executemany` / `IN`-list / `JOIN`). |
 | **R2 — commit-per-row** | > 100 commits, < 10 rows/commit, > 5% of wall in commit | You're committing per row — batch to 1,000+ rows per transaction. |
 | **R3 — DB-wait bound** | in-DB time > 60% of wall, CPU busy < 30% | The job is round-trip bound, not compute bound. |
+| **R4 — co-occurring pattern** | ≥ 2 query groups share a call site, > 1,000 combined calls, > 10% of wall | Several queries fire together every iteration — collapse them into one round-trip. Reports an estimated *queries-per-iteration*. |
 
 Findings that share a root cause **merge** (e.g. `R1+R2`), everything under 5% of wall is
-suppressed, and at most the top 3 are shown — ranked by seconds attributable.
+suppressed, and at most the top 3 are shown — ranked by seconds attributable. **R4** catches
+the case a per-group threshold can't: an N+1 pattern spread across a SELECT + UPDATE + INSERT
+that individually look innocent but fire as one unit each loop.
 
 **Every number is honest.** Query times are labelled *app-observed* (they include network,
 driver, and server time — not just Postgres). Anything that can't be measured prints `—`,
@@ -142,8 +150,9 @@ is framework-specific.
 start/end/rowcount/txn events from another driver, feed the same `RunSnapshot`, and the
 entire findings-and-report pipeline works for free. Good first backends:
 
+- [x] **Async SQLAlchemy** — call-site attribution through the greenlet boundary *(v0.2.0)*
 - [ ] **Raw `psycopg` / `psycopg2`** — cursor subclass or connection factory hook
-- [ ] **`asyncpg` / async SQLAlchemy** — the async execution path
+- [ ] **Raw `asyncpg`** (outside SQLAlchemy) — the async execution path
 - [ ] **Django ORM** — via `connection.execute_wrapper`
 - [ ] **Generic DB-API 2.0** — a monkeypatch-free `Cursor` proxy
 - [ ] New findings rules (N+1 `SELECT` detection, lock-wait, seq-scan heuristics)
@@ -153,10 +162,13 @@ gate** that every capture path must pass.
 
 ## Limitations (today)
 
-- SQLAlchemy **2.x, synchronous** only (1.4 may work; async does not yet).
-- Single process — no multiprocessing or async fan-out.
+- SQLAlchemy **2.x** (sync **and** async ORM/Core; 1.4 may work). Raw `asyncpg` *outside*
+  SQLAlchemy is not attributed yet.
+- Single process — no multiprocessing fan-out.
 - Query times are app-observed (network + driver + server), by design.
 - Commit timing is obtained by wrapping the dialect's commit; if that wrap fails it prints `—`.
+- Per-iteration ratios are **estimates** (labelled `≈`) inferred from co-occurring query
+  counts — shown only when the signal is strong, never guessed.
 
 These are the honest edges of a validation prototype, not permanent walls — see the roadmap.
 

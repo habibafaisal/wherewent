@@ -34,7 +34,11 @@ def render(run: RunSnapshot, findings: "list[Finding]") -> str:
         f"app-observed: includes network+driver+server)"
     )
     commit_str = f"{run.commit_time:.2f}s" if run.commit_time is not None else "—"
-    lines.append(f"commit time: {commit_str}   total rows: {run.total_rows:,}")
+    qpc = f"{run.total_queries / run.total_commits:.1f}" if run.total_commits > 0 else "—"
+    lines.append(
+        f"commit time: {commit_str}   total rows: {run.total_rows:,}   "
+        f"queries per commit: {qpc}"
+    )
     lines.append(
         f"recording added ~{run.overhead_time:.2f}s (~{_pct(run.overhead_time, wall)} of wall)"
     )

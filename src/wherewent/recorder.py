@@ -9,15 +9,18 @@ Design invariants (see build contract):
 """
 
 import atexit
+import functools
 import json
 import os
 import signal
 import statistics
 import sys
+import threading
+import time
 from time import perf_counter
 
-from . import report, rules
-from .callsite import capture_stack, resolve_call_site
+from . import callsite, report, rules
+from .callsite import capture_stack, get_async_site, resolve_call_site
 from .normalize import group_key, normalize_sql
 from .stats import GroupSnapshot, RunSnapshot
 
@@ -84,14 +87,70 @@ class Recorder:
         except Exception:
             self.sqlalchemy_active = False
 
+        # A1: async call-site attribution — wrap the AsyncSession/AsyncConnection
+        # user-entry coroutine methods so they stamp the call-site contextvar.
+        self._install_async_wrappers()
+
         atexit.register(self.finalize)
         self._install_signal_handlers()
+        self._start_interval_thread()
+
+    # -- async call-site wrappers (A1) -----------------------------------------
+
+    # coroutine methods that are user entry points for issuing SQL. commit()/
+    # flush() issue their SQL OUTSIDE execute(), so the whole family is wrapped.
+    _ASYNC_TARGETS = {
+        "AsyncSession": (
+            "execute", "scalars", "scalar", "stream", "stream_scalars",
+            "get", "commit", "flush", "refresh",
+        ),
+        "AsyncConnection": ("execute", "scalar", "scalars", "stream"),
+    }
+
+    def _install_async_wrappers(self):
+        try:
+            from sqlalchemy.ext import asyncio as sa_async
+        except Exception:
+            return  # async not available -> skip silently
+        for cls_name, methods in self._ASYNC_TARGETS.items():
+            cls = getattr(sa_async, cls_name, None)
+            if cls is None:
+                continue
+            for name in methods:
+                try:
+                    self._wrap_async_method(cls, name)
+                except Exception:
+                    pass
+
+    def _wrap_async_method(self, cls, name):
+        orig = getattr(cls, name, None)
+        if orig is None:
+            return  # method absent in this SQLAlchemy minor -> skip
+        if getattr(orig, "_wherewent_wrapped", False):
+            return  # idempotent: already wrapped
+
+        @functools.wraps(orig)
+        async def wrapper(self_, *args, **kwargs):
+            tok = callsite.set_async_site()
+            try:
+                return await orig(self_, *args, **kwargs)
+            finally:
+                callsite.reset_async_site(tok)
+
+        wrapper._wherewent_wrapped = True
+        setattr(cls, name, wrapper)
 
     def _install_signal_handlers(self):
         for sig in (signal.SIGINT, signal.SIGTERM):
             try:
                 self._prev_handlers[sig] = signal.getsignal(sig)
                 signal.signal(sig, self._handle_signal)
+            except Exception:
+                pass
+        # A4: SIGUSR1 -> mid-run PARTIAL SNAPSHOT (does not finalize/exit).
+        if hasattr(signal, "SIGUSR1"):
+            try:
+                signal.signal(signal.SIGUSR1, self._handle_peek_signal)
             except Exception:
                 pass
 
@@ -103,6 +162,43 @@ class Recorder:
         except Exception:
             pass
         sys.exit(130 if signum == signal.SIGINT else 143)
+
+    def _handle_peek_signal(self, signum, frame):
+        # A4: print a partial snapshot and RETURN — the job keeps running.
+        try:
+            self.peek(reason="SIGUSR1")
+        except Exception:
+            pass
+
+    def _start_interval_thread(self):
+        # A4: optional periodic PARTIAL SNAPSHOTs via WHEREWENT_INTERVAL seconds.
+        try:
+            raw = os.environ.get("WHEREWENT_INTERVAL")
+            if not raw:
+                return
+            interval = float(raw)
+            if interval <= 0:
+                return
+        except Exception:
+            return
+
+        def _loop():
+            while not self.finalized:
+                try:
+                    time.sleep(interval)
+                except Exception:
+                    return
+                if self.finalized:
+                    return
+                try:
+                    self.peek(reason="interval")
+                except Exception:
+                    pass
+
+        try:
+            threading.Thread(target=_loop, daemon=True).start()
+        except Exception:
+            pass
 
     # -- statement hooks -------------------------------------------------------
 
@@ -161,7 +257,12 @@ class Recorder:
             except Exception:
                 pass
 
-            site = resolve_call_site(skip=1)
+            # A1: prefer the async-stamped site (the sync frame walk finds no
+            # user frames inside a greenlet); only fall back to the frame walk
+            # when it is None, so sync overhead is unchanged.
+            site = get_async_site()
+            if site is None:
+                site = resolve_call_site(skip=1)
             if site is not None:
                 g["call_sites"][site] = g["call_sites"].get(site, 0) + 1
 
@@ -312,6 +413,28 @@ class Recorder:
             sqlalchemy_active=self.sqlalchemy_active,
             groups=groups,
         )
+
+    def peek(self, reason="signal"):
+        """A4: render the CURRENT state to stderr without finalizing/exiting.
+
+        Read-only (snapshot() only reads the accumulators) and fully guarded so a
+        mid-run trigger can never crash the host job. Does NOT set self.finalized,
+        so the atexit/signal final report still fires later.
+        """
+        try:
+            run = self.snapshot()
+            findings = rules.evaluate(run)
+            text = report.render(run, findings)
+            banner = "····· wherewent PARTIAL SNAPSHOT (job still running) ·····"
+            out = (
+                "\n" + banner + f"  [reason={reason}]\n"
+                + text + "\n"
+                + "····· end PARTIAL SNAPSHOT — job continues ·····\n"
+            )
+            sys.stderr.write(out)
+            sys.stderr.flush()
+        except Exception:
+            pass
 
     def finalize(self):
         if self.finalized:
