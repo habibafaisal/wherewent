@@ -227,11 +227,13 @@ class Recorder:
         # D2: rollback time is split out of commit_time. Both become measurable
         # together (same dialect wrap), so rollback mirrors commit_measurable.
         self.rollback_time = 0.0
+        self.rollback_measurable = False
 
         self.sqlalchemy_active = False
         self._prev_handlers = {}
         self._listeners = []   # D10: (identifier, fn) pairs registered on Engine
         self._wrapped_dialects = []  # D10: dialects whose commit/rollback we wrapped
+        self._meta_finders = []      # D10: sys.meta_path finders we inserted
 
         # -- unit-aware profiling (v0.3) --------------------------------------
         # All of this stays dormant (and the hot path unchanged) unless unit
@@ -320,6 +322,15 @@ class Recorder:
             self.installed = False
         except Exception:
             pass
+        # D10: drop the atexit report. Without this, a recorder that ever
+        # install()ed still prints its full report to stderr at interpreter
+        # shutdown even after disable() — surprising output from a recorder the
+        # embedder explicitly turned off. unregister() is a no-op if we never
+        # registered, so this stays idempotent.
+        try:
+            atexit.unregister(self.finalize)
+        except Exception:
+            pass
         # remove the SQLAlchemy event listeners we registered
         try:
             from sqlalchemy import event
@@ -350,6 +361,17 @@ class Recorder:
                 pass
         try:
             self._wrapped_dialects = []
+        except Exception:
+            pass
+        # drop any import hooks we inserted: a live finder would keep wrapping
+        # unit targets in modules imported after disable() (cross-test leak).
+        for finder in list(getattr(self, "_meta_finders", [])):
+            try:
+                sys.meta_path.remove(finder)
+            except Exception:
+                pass
+        try:
+            self._meta_finders = []
         except Exception:
             pass
 
@@ -661,6 +683,8 @@ class Recorder:
         except Exception:
             pass
         self.commit_measurable = True
+        # D2: the SAME wrap makes both timers real, so they flip together.
+        self.rollback_measurable = True
 
     # -- unit-aware profiling (v0.3) -------------------------------------------
 
@@ -720,9 +744,11 @@ class Recorder:
                 self._patch_module_attr(existing)
             if not self._unit_wrapped:
                 try:
-                    sys.meta_path.insert(
-                        0, _PostImportPatcher(self._unit_module, self._patch_module_attr)
+                    finder = _PostImportPatcher(
+                        self._unit_module, self._patch_module_attr
                     )
+                    sys.meta_path.insert(0, finder)
+                    self._meta_finders.append(finder)   # D10: so disable() can drop it
                 except Exception:
                     pass
         else:
@@ -739,9 +765,11 @@ class Recorder:
                     pass
             if not self._unit_wrapped:
                 try:
-                    sys.meta_path.insert(
-                        0, _BareNamePatcher(self._patch_bare, lambda: self._unit_wrapped)
+                    finder = _BareNamePatcher(
+                        self._patch_bare, lambda: self._unit_wrapped
                     )
+                    sys.meta_path.insert(0, finder)
+                    self._meta_finders.append(finder)   # D10: so disable() can drop it
                 except Exception:
                     pass
 
@@ -934,6 +962,75 @@ class Recorder:
 
     # -- snapshot / finalize ---------------------------------------------------
 
+    @staticmethod
+    def _duration_samples(g):
+        """Return a group's duration samples, whatever shape the group dict is.
+
+        D1 replaced the unbounded per-group `durations` list with a bounded
+        `dur_reservoir`. This reader is deliberately shape-tolerant: a group
+        dict produced by an older recorder, a restored --save payload, or any
+        other code path that still carries the legacy `durations` key must
+        still render. A READER of our own accumulator must never be able to
+        raise KeyError and take the whole report down with it.
+        """
+        try:
+            res = g.get("dur_reservoir")
+            if res:
+                return res
+            legacy = g.get("durations")      # pre-v0.3 unbounded list
+            if legacy:
+                return legacy
+        except Exception:
+            pass
+        return ()
+
+    def _emit_internal_error(self, where, exc):
+        """Honesty invariant: an internal failure is never silent — but it also
+        never propagates into the host job.
+
+        A blanket `except: pass` around report rendering turns a real bug into
+        an empty stderr, which reads to the user as "wherewent had nothing to
+        say". That is a lie. Degrade to a one-line, clearly-marked diagnostic
+        instead, then return normally.
+        """
+        try:
+            sys.stderr.write(
+                f"wherewent: internal error in {where} "
+                f"({type(exc).__name__}: {exc}) — no report could be rendered "
+                "for this call. Recording continues; your job is unaffected.\n"
+            )
+            sys.stderr.flush()
+        except Exception:
+            pass
+
+    def _snapshot_groups(self):
+        """Build the GroupSnapshot list defensively — every field is read with
+        .get() so a partially-populated group dict degrades instead of raising."""
+        groups = []
+        for key, g in list(self.groups.items()):
+            try:
+                # D1: sample median from the bounded reservoir (total_time is
+                # exact); falls back to a legacy `durations` list if present.
+                samples = self._duration_samples(g)
+                median = statistics.median(samples) if samples else 0.0
+                sites = g.get("call_sites") or {}
+                site = max(sites.items(), key=lambda kv: kv[1])[0] if sites else None
+                groups.append(
+                    GroupSnapshot(
+                        key=key,
+                        normalized_sql=g.get("normalized_sql", ""),
+                        calls=g.get("calls", 0),
+                        total_time=g.get("total_time", 0.0),
+                        median=median,
+                        rows=g.get("rows", 0),
+                        executemany_calls=g.get("executemany_calls", 0),
+                        call_site=site,
+                    )
+                )
+            except Exception:
+                continue   # one malformed group must not cost the whole report
+        return groups
+
     def snapshot(self) -> RunSnapshot:
         wall = (perf_counter() - self.start_perf) if self.start_perf else 0.0
 
@@ -947,30 +1044,11 @@ class Recorder:
             except Exception:
                 cpu = None
 
-        groups = []
-        for key, g in self.groups.items():
-            # D1: sample median from the bounded reservoir (total_time is exact).
-            res = g["dur_reservoir"]
-            median = statistics.median(res) if res else 0.0
-            site = None
-            if g["call_sites"]:
-                site = max(g["call_sites"].items(), key=lambda kv: kv[1])[0]
-            groups.append(
-                GroupSnapshot(
-                    key=key,
-                    normalized_sql=g["normalized_sql"],
-                    calls=g["calls"],
-                    total_time=g["total_time"],
-                    median=median,
-                    rows=g["rows"],
-                    executemany_calls=g["executemany_calls"],
-                    call_site=site,
-                )
-            )
+        groups = self._snapshot_groups()
 
         commit_time = self.commit_time if self.commit_measurable else None
         # D2: rollback becomes measurable together with commit (same wrap).
-        rollback_time = self.rollback_time if self.commit_measurable else None
+        rollback_time = self.rollback_time if self.rollback_measurable else None
 
         unit_stats = self._build_unit_stats() if self._unit_enabled else None
 
@@ -996,11 +1074,18 @@ class Recorder:
         Read-only (snapshot() only reads the accumulators) and fully guarded so a
         mid-run trigger can never crash the host job. Does NOT set self.finalized,
         so the atexit/signal final report still fires later.
+
+        If rendering itself fails, we say so on stderr rather than printing
+        nothing — a silent peek is indistinguishable from a broken install.
         """
         try:
             run = self.snapshot()
             findings = rules.evaluate(run)
             text = report.render(run, findings)
+        except Exception as exc:
+            self._emit_internal_error(f"peek(reason={reason})", exc)
+            return
+        try:
             banner = "····· wherewent PARTIAL SNAPSHOT (job still running) ·····"
             out = (
                 "\n" + banner + f"  [reason={reason}]\n"
@@ -1009,21 +1094,26 @@ class Recorder:
             )
             sys.stderr.write(out)
             sys.stderr.flush()
-        except Exception:
-            pass
+        except Exception as exc:
+            self._emit_internal_error(f"peek(reason={reason})", exc)
 
     def finalize(self):
         if self.finalized:
             return
         self.finalized = True
+        run = findings = None
         try:
             run = self.snapshot()
             findings = rules.evaluate(run)
             text = report.render(run, findings)
             sys.stderr.write(text + "\n")
             sys.stderr.flush()
-            if self.save_path:
-                self._write_json(run, findings)
+        except Exception as exc:
+            # Same honesty rule as peek(): never print nothing at all.
+            self._emit_internal_error("finalize()", exc)
+        try:
+            if self.save_path and run is not None:
+                self._write_json(run, findings or [])
         except Exception:
             pass
 

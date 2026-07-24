@@ -46,6 +46,13 @@ def render(run: RunSnapshot, findings: "list[Finding]") -> str:
         f"commit time: {commit_str}   total rows: {run.total_rows:,}   "
         f"queries per commit: {qpc}"
     )
+    # v0.3 (D2): rollback time is split OUT of commit time. It includes the
+    # do_rollback the connection pool fires as a reset on every checkin, which
+    # is not a real rollback -- say so rather than silently inflating either
+    # number. Omitted entirely when the dialect could not be wrapped (None).
+    rollback_time = getattr(run, "rollback_time", None)
+    if rollback_time is not None:
+        lines.append(f"rollback time: {rollback_time:.2f}s (incl. pool resets)")
     lines.append(
         f"recording added ~{run.overhead_time:.2f}s (~{_pct(run.overhead_time, wall)} of wall)"
     )
@@ -98,18 +105,38 @@ def render(run: RunSnapshot, findings: "list[Finding]") -> str:
             )
             first = us.first_window_mean_duration
             last = us.last_window_mean_duration
-            if first is not None and last is not None and us.count >= 20:
+            # v0.3 (D4/D9): queries/unit early-vs-late, shown alongside the
+            # duration windows. Read defensively -- appended fields.
+            first_q = getattr(us, "first_window_mean_queries", None)
+            last_q = getattr(us, "last_window_mean_queries", None)
+            dur_windows = first is not None and last is not None
+            q_windows = first_q is not None and last_q is not None
+            if (dur_windows or q_windows) and us.count >= 20:
                 lines.append("  GROWTH")
-                lines.append(f"    {'units 1–100':<20} {first * 1000:.0f} ms/unit")
-                lines.append(f"    {'units (last 100)':<20} {last * 1000:.0f} ms/unit")
-                delta = (last - first) / first if first > 0 else 0.0
-                if delta > 0.10:
-                    trend = f"+{delta * 100:.0f}% slower over the run"
-                elif delta < -0.10:
-                    trend = f"-{abs(delta) * 100:.0f}% faster over the run"
-                else:
-                    trend = "flat"
-                lines.append(f"    {'trend':<20} {trend}")
+                if dur_windows:
+                    lines.append(f"    {'units 1–100':<20} {first * 1000:.0f} ms/unit")
+                    lines.append(f"    {'units (last 100)':<20} {last * 1000:.0f} ms/unit")
+                if q_windows:
+                    lines.append(f"    {'queries 1–100':<20} {_qty(first_q)} queries/unit")
+                    lines.append(f"    {'queries (last 100)':<20} {_qty(last_q)} queries/unit")
+                if dur_windows:
+                    delta = (last - first) / first if first > 0 else 0.0
+                    if delta > 0.10:
+                        trend = f"+{delta * 100:.0f}% slower over the run"
+                    elif delta < -0.10:
+                        trend = f"-{abs(delta) * 100:.0f}% faster over the run"
+                    else:
+                        trend = "flat"
+                    lines.append(f"    {'trend':<20} {trend}")
+                if q_windows:
+                    q_delta = (last_q - first_q) / first_q if first_q > 0 else 0.0
+                    if q_delta > 0.10:
+                        q_trend = f"+{q_delta * 100:.0f}% more queries/unit over the run"
+                    elif q_delta < -0.10:
+                        q_trend = f"-{abs(q_delta) * 100:.0f}% fewer queries/unit over the run"
+                    else:
+                        q_trend = "flat"
+                    lines.append(f"    {'query trend':<20} {q_trend}")
             else:
                 lines.append("  GROWTH   — (need ≥20 units)")
 

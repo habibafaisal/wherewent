@@ -130,13 +130,21 @@ for receivable in book:
 ```
 UNIT: myapp.jobs:process_receivable   (1,203 units)
 ----------------------------------------------------------------------------------------------------
-  median duration     341 ms         queries/unit    135 (median)
-  commits/unit        1.0            rows/unit        46.0
+  median duration    341 ms         queries/unit    135 (median)
+  commits/unit       1.0            rows/unit       46.0
   GROWTH
     units 1–100          220 ms/unit
     units (last 100)     379 ms/unit
-    trend                +72% slower over the run     ← R6 fires
+    queries 1–100        98 queries/unit
+    queries (last 100)   171 queries/unit
+    trend                +72% slower over the run
+    query trend          +74% more queries/unit over the run     ← R6 fires
 ```
+
+R6 fires on **either** slope. That matters for a compute-bound job: if the clock stays flat but
+queries/unit climbs, the duration trend reads `flat` and only the query trend exposes the problem —
+so wherewent reports both and says plainly that the pattern is a *scalability* risk rather than the
+current wall-clock bottleneck.
 
 The growth trend is why a *sampled* run is honest: it shows cost-per-unit **rising**, so you
 know the full run will be worse than a linear extrapolation — the thing a totals-only profiler
@@ -163,9 +171,9 @@ shapes and counts is ever recorded.
 | **R1 — chatty group** | > 1,000 calls, > 10% of wall, median < 5ms | A fast query is called too many times — batch it (`executemany` / `IN`-list / `JOIN`). |
 | **R2 — commit-per-row** | > 100 commits, < 10 rows/commit, > 5% of wall in commit | You're committing per row — batch to 1,000+ rows per transaction. |
 | **R3 — DB-wait bound** | in-DB time > 60% of wall, CPU busy < 30% | The job is round-trip bound, not compute bound. |
-| **R4 — co-occurring pattern** | ≥ 2 query groups share a call site AND the pattern **scales** — many queries/iteration across many iterations, *or* > 10% of wall once one-time setup is excluded | Several queries fire together every iteration (SELECT + UPDATE + INSERT) — collapse them into one round-trip. Reports estimated *queries-per-iteration*, and flags patterns that scale even when a bounded run's clock hides them. |
-| **R5 — one-shot heavyweight** | a single `calls==1` statement > 15% of wall | One statement is a huge fixed cost. R1/R3/R4 all look for chattiness and miss it — R5 catches the single most fixable line. |
-| **R6 — rising per-unit cost** | per-unit time climbs ≥ 1.5× from the first 100 units to the last 100 (needs `--unit-function`/`wherewent.unit()`) | Cost per item grows as the run progresses — accumulating state, unbatched history reads, or a list that grows each loop. |
+| **R4 — co-occurring pattern** | ≥ 2 query groups fire from the **same function** AND the pattern **scales** — many queries/iteration across many iterations, *or* > 10% of wall once one-time setup is excluded | Several queries fire together every iteration (SELECT + UPDATE + INSERT) — collapse them into one round-trip. Clusters by *function*, not by line, so a helper that issues its statements on three different lines is still seen as **one** operation. One-shot (`calls == 1`) statements are excluded — they're fixed cost, and R5's job. Reports estimated *queries-per-iteration*, and flags patterns that scale even when a bounded run's clock hides them. |
+| **R5 — one-shot heavyweight** | a single `calls==1` statement > 15% of wall **or > 10s absolute** | One statement is a huge fixed cost. R1/R3/R4 all look for chattiness and miss it — R5 catches the single most fixable line. The absolute floor matters: 20s is worth cutting whether it's 24% of a sampled run or 1% of the full one. |
+| **R6 — rising per-unit cost** | per-unit **time** *or* **queries/unit** climbs ≥ 1.5× from the first 100 units to the last 100 (needs `--unit-function`/`wherewent.unit()`) | Cost per item grows as the run progresses — accumulating state, unbatched history reads, or a list that grows each loop. Reports the slope (queries/unit early vs late), so a compute-bound job whose *query* cost is growing still gets caught. |
 
 Findings that share a root cause **merge** (e.g. `R1+R2`), everything under 5% of wall is
 suppressed, and at most the top 3 are shown — ranked by seconds attributable. **R4** catches
@@ -227,6 +235,22 @@ gate** that every capture path must pass.
 - Per-unit **counts** (`--unit-function` / `wherewent.unit()`) are exact even under concurrent
   async units; per-unit **duration** is wall time and may overlap when units run concurrently —
   the common sequential-loop case is exact.
+- **R6's attributed seconds are a deterministic lower-bound estimate**, not a measurement. The
+  excess queries per unit are priced at the run's *mean* per-query DB time, so if the extra
+  queries are cheaper than average the true cost is higher (and vice versa). It is computed from
+  exact integer query counts rather than the clock, so it is reproducible run to run — but R6's
+  claim is the *slope*, not the seconds.
+- **ORM flush attribution.** Queries emitted by a `session.flush()`/`commit()` all resolve to that
+  one call site, so R4 can group unrelated writes under a single "workflow". When a cluster's
+  writes share one source line, wherewent labels it as possibly a single flush rather than
+  claiming you can collapse it — it will not tell you to batch something already batched.
+- Per-group **median** is a bounded *sample* median (reservoir of 5,000 executions per group) so
+  memory stays flat on million-query runs. `calls` and `total_time` remain exact.
+- **Commit vs rollback time are reported separately.** SQLAlchemy's pool issues a rollback on
+  every connection check-in, so rollback time is labelled *(incl. pool resets)* and is never
+  folded into commit time.
+- Findings describe **where the time goes and how it scales** — on a CPU-bound run they say so
+  explicitly, rather than implying that fixing the SQL will speed up this run.
 
 These are the honest edges of a validation prototype, not permanent walls — see the roadmap.
 

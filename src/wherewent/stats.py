@@ -13,7 +13,10 @@ class GroupSnapshot:
     normalized_sql: str
     calls: int
     total_time: float            # seconds, app-observed (includes driver+network+server)
-    median: float                # seconds; 0.0 if no samples
+    # v0.3 hardening (D1): a bounded SAMPLE median (reservoir cap 5000), not an
+    # exact one, once a group exceeds the cap. `calls` and `total_time` stay
+    # EXACT. 0.0 if no samples.
+    median: float                # seconds; sample median; 0.0 if no samples
     rows: int                    # summed cursor.rowcount where >= 0, else 0 contribution
     executemany_calls: int
     call_site: "tuple[str, int, str] | None"  # (file, line, function); None if unresolved

@@ -129,11 +129,6 @@ SITE_INSERT = ("worker.py", 93, "process_chain_state")
 # pass early, that would hide the exact bug the key change fixes.
 # --------------------------------------------------------------------------
 
-@pytest.mark.xfail(
-    reason="pending rules.py R4 clustering-key change (file,line,func) -> (file,func); "
-           "fixture deliberately spreads SELECT/UPDATE/INSERT across 3 lines of one function",
-    strict=False,
-)
 def test_r4_fires_for_cooccurring_groups_below_r1_individually():
     # 3 groups sharing one call SITE (same file+function, different lines) --
     # a SELECT + UPDATE + audit INSERT that fire together once per loop
@@ -172,11 +167,6 @@ def test_r4_fires_for_cooccurring_groups_below_r1_individually():
     assert not any(f.rule == "R1" for f in findings)
 
 
-@pytest.mark.xfail(
-    reason="pending rules.py R4 clustering-key change (file,line,func) -> (file,func); "
-           "fixture deliberately spreads SELECT/UPDATE across 2 lines of one function",
-    strict=False,
-)
 def test_r4_detail_reports_per_iteration_ratio_when_groups_near_equal():
     groups = [
         make_group(key="k1", normalized_sql="SELECT 1 FROM a WHERE id = ?",
@@ -262,11 +252,6 @@ def test_r4_still_blocked_below_10pct_when_it_does_not_scale():
     assert not any("R4" in f.rule for f in findings)
 
 
-@pytest.mark.xfail(
-    reason="pending rules.py R4 clustering-key change (file,line,func) -> (file,func); "
-           "fixture deliberately spreads SELECT/UPDATE/INSERT across 3 lines of one function",
-    strict=False,
-)
 def test_r4_fires_below_10pct_raw_wall_when_it_scales():
     # The feedback fixture (DESIGN-v3.md): a big one-shot preload/gate-scan
     # (calls == 1, ~29s) inflates a bounded run's wall so much that a
@@ -329,11 +314,6 @@ def test_r4_fires_below_10pct_raw_wall_when_it_scales():
 # R4 subsumes R1 when R1's group sits inside an R4 cluster (no double count)
 # --------------------------------------------------------------------------
 
-@pytest.mark.xfail(
-    reason="pending rules.py R4 clustering-key change (file,line,func) -> (file,func); "
-           "fixture deliberately spreads its 3 groups across 3 lines of one function",
-    strict=False,
-)
 def test_r4_subsumes_r1_when_r1_group_is_inside_the_cluster():
     r1_group = make_group(key="hot", calls=20000, median=0.0004, total_time=8.0, call_site=SITE_SELECT)
     sibling_a = make_group(key="sib_a", normalized_sql="UPDATE t SET x = ? WHERE id = ?",

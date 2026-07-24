@@ -277,6 +277,20 @@ def growth_process_one(session, i):
     session.commit()
 
 
+def _expected_unit_queries(i):
+    """Exact query count growth_process_one issues for unit `i`.
+
+    1 INSERT + (1 + i // GROWTH_BLOCK) COUNT(*) scans. Commits are accounted
+    separately by the recorder, so they are not queries. Kept in lockstep with
+    growth_process_one above so the windows below are derived, not magic.
+    """
+    return 1 + (1 + i // GROWTH_BLOCK)
+
+
+def _window_mean_queries(lo, hi):
+    return sum(_expected_unit_queries(i) for i in range(lo, hi)) / (hi - lo)
+
+
 def test_growth_triggers_r6_via_unit_function(tmp_path, monkeypatch, unit_recorder):
     """End-to-end: a real Recorder + real --unit-function wrapping + a real
     SQLAlchemy loop -> snapshot() -> rules.evaluate(). Deliberately NOT a
@@ -302,32 +316,46 @@ def test_growth_triggers_r6_via_unit_function(tmp_path, monkeypatch, unit_record
     assert us.count == GROWTH_TOTAL
 
     # The fixture is built so the per-unit query COUNT genuinely rises
-    # (1 -> 10 real scans/unit across the run); assert that directly before
-    # trusting the R6 duration signal built on top of it.
-    assert us.mean_queries > 2.0, (
-        f"growth fixture issues a rising 1..10 queries/unit -- expected mean_queries "
-        f"well above the 1-query floor, got {us.mean_queries}"
+    # (2 -> 11 real queries/unit across the run). Query counts are exact
+    # integers the recorder attributes directly, so every assertion below is
+    # deterministic -- unlike per-unit DURATION, which is wall time and drifts
+    # with system noise plus first-window statement-compilation warmup (observed
+    # last/first duration ratios of 1.72x-2.43x run to run, i.e. straddling a
+    # 1.5x bar). R6 fires on EITHER the duration slope OR the query slope (D9),
+    # so this drives and asserts the deterministic half.
+    exp_first_q = _window_mean_queries(0, 100)                          # 3.2
+    exp_last_q = _window_mean_queries(GROWTH_TOTAL - 100, GROWTH_TOTAL)  # 9.8
+    exp_mean_q = _window_mean_queries(0, GROWTH_TOTAL)                  # 6.5
+
+    assert us.mean_queries == pytest.approx(exp_mean_q), (
+        f"growth fixture issues an exactly-known rising 2..11 queries/unit; "
+        f"expected mean_queries={exp_mean_q}, got {us.mean_queries}"
     )
 
+    assert us.first_window_n == 100
+    assert us.last_window_n == 100
+    first_q = us.first_window_mean_queries
+    last_q = us.last_window_mean_queries
+    assert first_q == pytest.approx(exp_first_q), (
+        f"first 100 units issue exactly {exp_first_q} queries/unit on average, got {first_q}"
+    )
+    assert last_q == pytest.approx(exp_last_q), (
+        f"last 100 units issue exactly {exp_last_q} queries/unit on average, got {last_q}"
+    )
+    # This is the exact bar R6's query slope tests. 9.8 / 3.2 = 3.06x, cleared
+    # by a factor of two on integers that cannot move -- no wall clock involved.
+    assert last_q >= 1.5 * first_q, (
+        f"first_window_mean_queries={first_q} last_window_mean_queries={last_q} "
+        "-- the rising per-unit query load must clear R6's 1.5x slope bar"
+    )
+
+    # Duration windows must still be populated and positive (that much IS
+    # deterministic); their RATIO is deliberately not asserted -- it is real
+    # wall time, and R6 does not need it to fire here.
     assert us.first_window_mean_duration is not None
     assert us.last_window_mean_duration is not None
-    assert us.last_window_mean_duration >= 1.5 * us.first_window_mean_duration, (
-        f"first={us.first_window_mean_duration!r} last={us.last_window_mean_duration!r} "
-        "-- growth fixture (query COUNT genuinely rising 1..10 real COUNT(*) scans/unit "
-        "over an ever-growing table) should clear 1.5x"
-    )
-
-    # Opportunistic: if UnitStats grew a per-window QUERY-count slope
-    # alongside the duration slope, check it too -- but don't hard-fail if
-    # this build doesn't expose it, since it's not part of the originally
-    # pinned field list (_UNIT_STATS_FIELDS below).
-    first_q = getattr(us, "first_window_mean_queries", None)
-    last_q = getattr(us, "last_window_mean_queries", None)
-    if first_q is not None and last_q is not None and first_q > 0:
-        assert last_q > first_q, (
-            f"first_window_mean_queries={first_q} last_window_mean_queries={last_q} "
-            "should also rise now that this build tracks it"
-        )
+    assert us.first_window_mean_duration > 0
+    assert us.last_window_mean_duration > 0
 
     findings = rules.evaluate(run)
     r6 = [f for f in findings if f.rule == "R6"]
@@ -335,8 +363,33 @@ def test_growth_triggers_r6_via_unit_function(tmp_path, monkeypatch, unit_record
     finding = r6[0]
     assert finding.title.lower().startswith("rising")
 
-    expected_seconds = max(0.0, (us.mean_duration - us.first_window_mean_duration) * us.count)
+    # R6's attributed seconds must be the QUERY-derived estimate, priced at the
+    # run's mean per-query DB time -- not the duration-derived one. Per-unit
+    # query counts are exact integers the recorder attributes directly (zero
+    # clock involvement), so this number is reproducible run to run. The
+    # duration windows are NOT a clean baseline: the first window pays
+    # one-time SQLAlchemy statement-compilation warmup, which inflates
+    # `first_window_mean_duration` and biases a duration-derived estimate low
+    # -- by enough, on real runs, to flip whether R6 clears the trivia filter
+    # from one byte-identical run to the next. Compute the expectation from
+    # the snapshot's own public numbers, independent of the rule's source.
+    per_q = (run.db_time / run.total_queries) if run.total_queries > 0 else 0.0
+    excess = max(0.0, (us.mean_queries - first_q)) * us.count
+    expected_seconds = max(0.0, excess * per_q)
     assert finding.seconds == pytest.approx(expected_seconds, rel=1e-6)
+
+    # Determinism guard: this pins the actual defect. The duration-derived
+    # quantity below must NOT be what R6 reported -- if a regression makes R6
+    # prefer the warmup-contaminated duration estimate again, this fails
+    # loudly instead of only flaking on other machines/runs.
+    duration_derived_seconds = max(
+        0.0, (us.mean_duration - us.first_window_mean_duration) * us.count
+    )
+    assert finding.seconds != pytest.approx(duration_derived_seconds, rel=1e-6), (
+        f"R6 seconds ({finding.seconds}) matches the warmup-contaminated "
+        f"duration-derived estimate ({duration_derived_seconds}) -- expected the "
+        "deterministic query-derived attribution instead"
+    )
 
     detail = finding.detail
     assert "100" in detail, f"detail should name the 100-unit windows: {detail!r}"

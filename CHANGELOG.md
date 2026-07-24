@@ -36,6 +36,55 @@ that actually scales.
   units markedly slower than early ones), R6 flags the growing-per-item-work smell.
 - `demo/unit_job.py` plus unit / one-shot / R4-scale tests.
 
+### Hardened (post-review)
+A review pass against real workloads found nine defects; all are fixed in this release.
+
+- **R4 clustered by source LINE, not by function** — the highest-impact bug. A helper that
+  issued its INSERT/SELECT/UPDATE on three different lines of one function fragmented into
+  three sub-threshold clusters, so R4 never fired on exactly the N+1 pattern it exists to
+  catch. Clusters are now keyed by `(file, function)` and recombine. One-shot (`calls == 1`)
+  statements are excluded from clustering — they are fixed cost, and R5's job.
+- **R4 flush-attribution guard.** Coarsening the key can merge writes that a single
+  `session.flush()`/`commit()` emitted. When a cluster's writes share one source line,
+  wherewent labels it as possibly one flush and will not advise "collapse into one
+  round-trip" for something already batched.
+- **R5 gained an absolute floor** (`> 15% of wall` **or** `> 10s`). A 20s one-shot is worth
+  cutting whether it is 24% of a sampled run or 1% of the full one; the previous
+  percent-only gate went silent on exactly the large runs that matter. The final
+  suppression filter gained a matching escape hatch so such findings are not re-dropped.
+- **R6 also fires on the queries/unit slope**, not only duration, and reports it — so a
+  compute-bound job whose per-unit query cost is growing is still caught.
+- **CPU-bound honesty framing.** When a run is compute-bound, R4/R6 say the pattern is a
+  scalability risk that dominates at full volume rather than implying it is the current
+  wall-clock bottleneck.
+- **Bounded memory.** Per-group durations were an unbounded list (one float per execution).
+  They are now a 5,000-sample reservoir: memory stays flat on million-query runs, `calls`
+  and `total_time` stay exact, and the median is honestly a *sample* median.
+- **Commit vs rollback time are no longer conflated.** SQLAlchemy's pool issues a rollback
+  on every connection check-in, which was inflating commit time; rollback time is now
+  reported separately and labelled *(incl. pool resets)*.
+- **Execution-context leak on error paths.** A failed statement never fires
+  `after_cursor_execute`, leaking a timing entry per error; a `handle_error` listener now
+  cleans up.
+- **Silent internal failures.** `peek()`/`finalize()` wrapped rendering in a bare
+  `except: pass`, so an internal error printed as empty output — indistinguishable from
+  "nothing to report". They now emit a clearly-marked internal-error line and keep
+  recording, still without ever raising into the host job.
+- **`Recorder.disable()`** added to fully unwind class-level hooks, dialect wrappers and
+  import hooks — for embedders and test isolation.
+- **R6 fired nondeterministically on identical input.** Its attributed seconds were derived
+  from `(mean_duration − first_window_mean_duration) × count`, but the first window pays
+  one-time SQLAlchemy statement-compilation warmup, which is not part of the steady-state
+  per-unit price. That inflated the baseline and biased the estimate low — enough that on
+  ten runs of a byte-identical workload the value landed as close as 1.02× the suppression
+  threshold, so R6 appeared in only some runs. It now prefers a **query-derived**
+  attribution (excess queries per unit, priced at the run's mean per-query DB time), which
+  uses exact integer counts and no clock at all: the query windows were identical across all
+  ten runs while the duration windows spread 46%. R6 is also **exempt from the
+  share-of-wall trivia filter** — it is a trend finding whose current-run magnitude is small
+  by construction, which is precisely what it is telling you. Its 1.5× firing bar is
+  unchanged and remains the thing that decides whether it is real.
+
 ### Notes
 - Per-unit COUNTS are exact even under concurrent async units (attributed via a
   contextvar); per-unit DURATION is wall time and may overlap for concurrently-running
