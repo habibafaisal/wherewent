@@ -67,6 +67,27 @@ async def _process_one(session: AsyncSession, i: int) -> None:
     await session.execute(select(Widget).where(Widget.name == f"w-{i}"))
 
 
+@pytest.fixture
+def installed_recorder(request):
+    """A fresh Recorder(), install()ed and GUARANTEED disable()d at teardown.
+
+    Recorder.install() registers its SQLAlchemy listeners at the Engine CLASS
+    level (process-global by design), and recorder.py's one-time commit/rollback
+    timing wrap is guarded per DIALECT INSTANCE (`dialect._wherewent_wrapped`),
+    not per Recorder. So a recorder from this module that was never disabled
+    would keep winning that one-time wrap on every engine created afterwards,
+    permanently denying commit_measurable/rollback_measurable to any Recorder
+    built by a LATER test in the same process (see the D2 tests in
+    tests/test_hardening.py). disable() removes the class-level listeners,
+    restores wrapped dialects and drops our sys.meta_path finders, so tearing
+    down here keeps this module order-independent.
+    """
+    rec = Recorder()
+    rec.install(None)
+    request.addfinalizer(rec.disable)
+    return rec
+
+
 def _find_group(groups, keyword):
     for g in groups:
         sql = g.normalized_sql.lower()
@@ -75,15 +96,16 @@ def _find_group(groups, keyword):
     return None
 
 
-def test_async_insert_and_select_groups_get_a_real_call_site(tmp_path):
+def test_async_insert_and_select_groups_get_a_real_call_site(tmp_path, installed_recorder):
     # A fresh Recorder(), not the module singleton: DESIGN-v2.md documents
     # the async wrappers as global, idempotent monkeypatches installed
     # inside Recorder.install() (guarded by a sentinel attr), so constructing
     # our own instance is safe and keeps this test's accounting isolated from
     # any other test that touches the shared `recorder` singleton. install()
     # must still be called -- the async wrappers are only installed there.
-    rec = Recorder()
-    rec.install(None)
+    # The fixture owns install()/disable() so the process-global hooks never
+    # leak into a later test.
+    rec = installed_recorder
 
     db_path = tmp_path / "async_callsite.db"
     asyncio.run(_run_async_job(str(db_path), ROWS))
@@ -111,13 +133,12 @@ def test_async_insert_and_select_groups_get_a_real_call_site(tmp_path):
         assert isinstance(line, int) and line > 0
 
 
-def test_async_call_site_survives_commit_before_execute_boundary(tmp_path):
+def test_async_call_site_survives_commit_before_execute_boundary(tmp_path, installed_recorder):
     # The addendum explicitly calls out that INSERTs issued from
     # session.commit()/flush bypass execute(), so *every* async entrypoint
     # that can trigger a flush must stamp the contextvar, not just execute().
     # This re-asserts that specifically for the commit-triggered INSERT.
-    rec = Recorder()
-    rec.install(None)
+    rec = installed_recorder
 
     db_path = tmp_path / "async_callsite_commit.db"
     asyncio.run(_run_async_job(str(db_path), ROWS))

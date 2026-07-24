@@ -41,6 +41,18 @@ def wherewent_cmd(save_path, job_path):
     return [sys.executable, "-m", "wherewent.cli", "run", "--save", save_path, sys.executable, job_path]
 
 
+def wherewent_cmd_unit(save_path, unit_spec, module_name):
+    # `python -m demo.run_units` (not a bare script path) -- see
+    # demo/unit_job.py / demo/run_units.py docstrings for why module identity
+    # matters for --unit-function to actually patch what the loop calls.
+    exe = shutil.which("wherewent")
+    base = [exe] if exe else [sys.executable, "-m", "wherewent.cli"]
+    return base + [
+        "run", "--save", save_path, "--unit-function", unit_spec,
+        sys.executable, "-m", module_name,
+    ]
+
+
 def load_findings(path):
     with open(path) as f:
         data = json.load(f)
@@ -59,10 +71,26 @@ def find_insert_group(groups):
     return max(matches, key=lambda g: g["calls"]) if matches else None
 
 
+# Every failing check's label, in the order it was reported, so a CI failure can
+# name WHICH sub-check failed instead of just printing `=== RESULT: FAIL ===`.
+# Sub-checks inside check_unit_end_to_end / check_async_end_to_end are aggregated
+# with all(...), which loses the label -- this list keeps it.
+FAILED_CHECKS = []
+
+
 def check(label, condition, detail=""):
     status = "PASS" if condition else "FAIL"
     print(f"[{status}] {label}{(' -- ' + detail) if detail else ''}")
+    if not condition:
+        FAILED_CHECKS.append(label)
     return condition
+
+
+def skip(label, detail=""):
+    """Same reporting shape as check(), for a check that was not run at all.
+    Never counts as a pass and never counts as a failure -- it is loud in the
+    log precisely so a SKIPPED can't be mistaken for a PASS."""
+    print(f"[SKIPPED] {label}{(' -- ' + detail) if detail else ''}")
 
 
 def check_async_end_to_end(env, scratch, async_rows):
@@ -122,6 +150,198 @@ def check_async_end_to_end(env, scratch, async_rows):
             f"named_sites={matched} candidates={sorted(candidate_sites)} rules={[f['rule'] for f in async_findings]}",
         )
     )
+    return all(sub_results)
+
+
+def _approx(a, b, tol=0.05):
+    return a is not None and abs(a - b) <= tol
+
+
+def _find_r4_cluster(groups):
+    """Group JSON group dicts by call site, return the qualifying (>=2
+    distinct groups) cluster with the most combined calls, or None. Mirrors
+    (a simplified, JSON-only view of) rules.py's own R4 clustering so the
+    benchmark can independently show the "<10% of raw wall" claim, not just
+    trust the rule fired.
+
+    Keyed on (file, function), NOT the full (file, line, function) tuple --
+    matching rules.py's clustering-key fix (DESIGN-v3.md addendum): real
+    same-function helper code spreads its statements across several lines
+    (demo/unit_job.py's process_one does exactly this -- SELECT, UPDATE,
+    INSERT each on their own line), so an exact-tuple key would never see
+    them as one cluster. This helper reflects the CORRECT/target clustering;
+    whether `has_rule(unit_findings, "R4")` below actually agrees depends on
+    whether that rules.py fix has landed yet in this build.
+    """
+    by_site = {}
+    for g in groups:
+        site = g.get("call_site")
+        if not site:
+            continue
+        key = (site[0], site[2])  # (file, function) -- drop the line number
+        by_site.setdefault(key, []).append(g)
+
+    best = None
+    for site, gs in by_site.items():
+        distinct = {g["key"] for g in gs}
+        if len(distinct) < 2:
+            continue
+        combined_calls = sum(g["calls"] for g in gs)
+        combined_time = sum(g["total_time"] for g in gs)
+        if best is None or combined_calls > best[1]:
+            best = (site, combined_calls, combined_time, gs)
+    return best
+
+
+def check_unit_end_to_end(env, scratch):
+    """Optional section proving v0.3's unit-aware profiling (--unit-function)
+    end-to-end, using demo/unit_job.py's feedback-shaped job: runs it under
+    `wherewent run --unit-function demo.unit_job:process_one --save` and
+    checks unit_stats is populated correctly, R4 fires despite the per-unit
+    query cluster being under 10% of RAW wall (the v0.3 fix, proven with real
+    numbers rather than just trusting the rule name), R5 names the one-shot
+    heavyweight self-join, and R6 fires on the engineered growth.
+
+    Gated so a wherewent build that does not yet support --unit-function
+    (unit_stats absent from the JSON -- mid-integration per DESIGN-v3.md)
+    SKIPS rather than fails, same convention as check_async_end_to_end above.
+    Does NOT count toward the sync overhead gate or the async assertions.
+    """
+    unit_rows = int(os.environ.get("WHEREWENT_UNIT_ROWS", "400"))
+    ledger_rows = int(os.environ.get("WHEREWENT_UNIT_LEDGER_ROWS", "5500"))
+    expected_queries_per_unit = 3  # SELECT + UPDATE + INSERT, see unit_job.process_one
+
+    unit_env = env.copy()
+    unit_env["WHEREWENT_UNIT_ROWS"] = str(unit_rows)
+    unit_env["WHEREWENT_UNIT_LEDGER_ROWS"] = str(ledger_rows)
+    unit_env["WHEREWENT_UNIT_DEMO_DB"] = os.path.join(scratch, "unit_demo.db")
+    # `python -m demo.run_units` needs the repo root (parent of demo/) on
+    # PYTHONPATH regardless of subprocess cwd.
+    repo_root = os.path.dirname(DEMO_DIR)
+    existing_pp = unit_env.get("PYTHONPATH", "")
+    unit_env["PYTHONPATH"] = os.pathsep.join([repo_root] + ([existing_pp] if existing_pp else []))
+
+    unit_json = os.path.join(scratch, "unit.json")
+    run(
+        wherewent_cmd_unit(unit_json, "demo.unit_job:process_one", "demo.run_units"),
+        unit_env,
+        "unit job (recorded, --unit-function)",
+    )
+
+    try:
+        unit_data, unit_findings = load_findings(unit_json)
+    except (FileNotFoundError, json.JSONDecodeError) as exc:
+        print(f"\n--- unit-function check: SKIPPED (no/invalid JSON written -- {exc}) ---")
+        return None
+
+    if "unit_stats" not in unit_data:
+        print(
+            "\n--- unit-function check: SKIPPED (unit_stats absent from JSON -- this "
+            "wherewent build does not yet support --unit-function; pending Agent A/B "
+            "integration per DESIGN-v3.md) ---"
+        )
+        return None
+
+    us = unit_data.get("unit_stats")
+    wall = unit_data.get("wall_time") or 0
+    unit_rules = [f["rule"] for f in unit_findings]
+
+    print("\n=== UNIT-AWARE PROFILING ASSERTIONS (optional, proves v0.3 end-to-end) ===")
+    sub_results = [
+        check("unit_stats is non-null (target was wrapped and called)", us is not None, f"unit_stats={us}")
+    ]
+    if us is None:
+        return all(sub_results)
+
+    sub_results.append(
+        check("unit_stats.count == rows", us.get("count") == unit_rows,
+              f"count={us.get('count')} rows={unit_rows}")
+    )
+    sub_results.append(
+        check(
+            f"unit_stats.median_queries == {expected_queries_per_unit} (SELECT+UPDATE+INSERT)",
+            _approx(us.get("median_queries"), expected_queries_per_unit, tol=0.1),
+            f"median_queries={us.get('median_queries')}",
+        )
+    )
+
+    cluster = _find_r4_cluster(unit_data.get("groups", []))
+    if cluster is not None:
+        site, combined_calls, combined_time, gs = cluster
+        raw_pct = (combined_time / wall * 100) if wall > 0 else float("inf")
+        sub_results.append(
+            check(
+                "R4 cluster combined_calls > 1000",
+                combined_calls > 1000,
+                f"combined_calls={combined_calls}",
+            )
+        )
+        # This one is a FIXTURE PRECONDITION, not a claim about wherewent: it
+        # asserts this run actually reproduced the v0.3 trap (a per-unit cluster
+        # that is small relative to raw wall) so that the "R4 fires despite ..."
+        # assertion below is a meaningful test of the fix. Under disk/IO
+        # contention the per-unit query time inflates while the one-shot
+        # heavyweight does not, which shifts the ratio past 10%. On such a run
+        # the honest outcome is SKIPPED -- you cannot assert "R4 fires *despite*
+        # being under 10% of wall" on a run where it was not under 10% of wall.
+        # Same skipped-not-failed convention as the unit_stats gate above.
+        if raw_pct < 10.0:
+            sub_results.append(
+                check(
+                    "R4 cluster is < 10% of RAW wall (the v0.3 trap this fixture reproduces)",
+                    raw_pct < 10.0,
+                    f"combined_time={combined_time:.3f}s wall={wall:.3f}s = {raw_pct:.1f}%",
+                )
+            )
+        else:
+            skip(
+                "R4 cluster is < 10% of RAW wall (the v0.3 trap this fixture reproduces)",
+                f"FIXTURE PRECONDITION NOT REPRODUCED ON THIS RUN: "
+                f"combined_time={combined_time:.3f}s wall={wall:.3f}s = {raw_pct:.1f}% "
+                f"(>= 10.0%, likely disk/IO contention inflating per-unit query time). "
+                f"This is NOT a pass and NOT a wherewent failure -- the 'R4 fires despite "
+                f"...' assertion below still runs and can still FAIL.",
+            )
+    else:
+        sub_results.append(check("R4 cluster found in JSON groups", False, "no >=2-group call_site cluster"))
+
+    sub_results.append(
+        check("R4 fires despite the cluster being < 10% of raw wall (the fix)",
+              has_rule(unit_findings, "R4"), f"rules={unit_rules}")
+    )
+
+    r5_findings = [f for f in unit_findings if "R5" in f.get("rule", "")]
+    r5_names_heavyweight = any("unit_job.py" in f.get("detail", "") for f in r5_findings)
+    sub_results.append(
+        check(
+            "R5 fires and names the one-shot heavyweight self-join",
+            bool(r5_findings) and r5_names_heavyweight,
+            f"r5={r5_findings}",
+        )
+    )
+
+    first_mean_duration = us.get("first_window_mean_duration")
+    last_mean_duration = us.get("last_window_mean_duration")
+    first_mean_queries = us.get("first_window_mean_queries")
+    last_mean_queries = us.get("last_window_mean_queries")
+    # Gate on query-count slope, not wall-clock duration: per-unit query counts are
+    # exact integers the recorder attributes directly (zero clock involvement), while
+    # first-window durations are inflated by one-time SQLAlchemy statement-compilation
+    # warmup -- that noise shrinks the duration-ratio margin enough to flake in CI.
+    growth_strong = (
+        first_mean_queries is not None and last_mean_queries is not None and first_mean_queries > 0
+        and last_mean_queries >= 1.5 * first_mean_queries
+    )
+    r6_fired = has_rule(unit_findings, "R6")
+    sub_results.append(
+        check(
+            "R6 fires (growth engineered to be strong: last-100 mean queries >= 1.5x first-100 mean queries)",
+            (not growth_strong) or r6_fired,
+            f"first_window_mean_queries={first_mean_queries} last_window_mean_queries={last_mean_queries} "
+            f"first_window_mean_duration={first_mean_duration} last_window_mean_duration={last_mean_duration} rules={unit_rules}",
+        )
+    )
+
     return all(sub_results)
 
 
@@ -194,8 +414,23 @@ def main():
     if async_ok is not None:
         results.append(async_ok)
 
+    # Optional: proves v0.3's unit-aware profiling (--unit-function, R4's
+    # fix, R5, R6) end-to-end. Skipped -- not failed -- until unit_stats
+    # shows up in the JSON (mid-integration per DESIGN-v3.md). Does NOT
+    # count toward the sync overhead gate or weaken any assertion above.
+    unit_ok = check_unit_end_to_end(env, scratch)
+    if unit_ok is not None:
+        results.append(unit_ok)
+
     ok = all(results)
     print(f"\n=== RESULT: {'PASS' if ok else 'FAIL'} ===")
+    if not ok:
+        # Name every failed check, including sub-checks from the async/unit
+        # sections whose labels are otherwise swallowed by all(sub_results),
+        # so a red CI run is self-diagnosing from the scrollback alone.
+        print(f"\n=== FAILED CHECKS ({len(FAILED_CHECKS)}) ===")
+        for label in FAILED_CHECKS:
+            print(f"  - {label}")
     sys.exit(0 if ok else 1)
 
 

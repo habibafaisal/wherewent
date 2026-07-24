@@ -6,12 +6,44 @@ stay honest: a rule only fires when its inputs are actually measurable.
 
 from .stats import Finding, RunSnapshot
 
+# --- module constants (v0.3 hardening contract) -------------------------------
+# R5 must not inherit the scale-blindness R4 had: a 20.7s one-shot is 25% of a
+# bounded sample run but <1% of the full run, so a pure "% of wall" gate goes
+# SILENT on exactly the run that matters. An absolute floor keeps it honest.
+R5_ABS_SECONDS = 10.0     # one-shot heavyweight absolute floor (seconds)
+KEEP_ABS_SECONDS = 10.0   # trivia-filter escape hatch: keep anything this big
+
+# SQL shapes that an ORM unit-of-work emits at flush()/commit() time. Used only
+# by R4's flush-attribution guard (D6) -- deliberately simple prefix matching;
+# perfect flush detection is out of scope.
+_WRITE_PREFIXES = ("INSERT", "UPDATE", "DELETE", "MERGE", "REPLACE")
+
+# A cluster counts as "write dominated" when this share of its calls are writes.
+_WRITE_DOMINANCE = 0.80
+
 
 def _site_str(group) -> str:
     if group.call_site:
         f, ln, _fn = group.call_site
         return f"{f}:{ln}"
     return "unknown"
+
+
+def _site_line(group):
+    """The group's OWN source line, or None when unresolved."""
+    try:
+        if group.call_site:
+            return group.call_site[1]
+    except Exception:
+        pass
+    return None
+
+
+def _is_write(sql) -> bool:
+    try:
+        return sql.strip().upper().startswith(_WRITE_PREFIXES)
+    except Exception:
+        return False
 
 
 def _within(a: float, b: float, frac: float) -> bool:
@@ -27,7 +59,24 @@ def evaluate(run: RunSnapshot) -> "list[Finding]":
     if wall <= 0:
         return []
 
+    # One-time (calls==1) statements dominate a bounded run's clock but do NOT
+    # scale with input size. Exclude them to get a "variable" baseline against
+    # which a scaling N+1 cluster can be judged (R4-fix, below).
+    fixed_cost_time = sum(g.total_time for g in run.groups if g.calls == 1)
+    variable_wall = max(wall - fixed_cost_time, 1e-9)  # wall minus one-shot setup
+
     cpu_busy = (run.cpu_time / wall) if (run.cpu_time is not None and wall > 0) else None
+
+    # D8: when the process is compute-bound, R4/R6 must NOT imply that the SQL
+    # is the current wall-clock bottleneck. They still matter -- both scale with
+    # input size -- so frame them as a SCALABILITY risk, honestly.
+    cpu_caveat = None
+    if cpu_busy is not None and cpu_busy >= 0.5:
+        cpu_caveat = (
+            f"This run is CPU-bound (CPU busy {cpu_busy * 100:.0f}%): this pattern is a "
+            f"SCALABILITY risk that will dominate at full volume, NOT the current "
+            f"wall-clock bottleneck. Fixing it speeds up large runs, not this sample."
+        )
 
     r1 = r1_group = None
     r2 = None
@@ -117,32 +166,91 @@ def evaluate(run: RunSnapshot) -> "list[Finding]":
     # Additive, additional to R1/R2/R3 above: an N+1 pattern spread across
     # several query groups (e.g. SELECT + UPDATE + INSERT all fired once per
     # loop iteration from the same call site) can be individually under R1's
-    # per-group bars yet obviously bad in aggregate. Cluster by call_site,
+    # per-group bars yet obviously bad in aggregate. Cluster by call site,
     # THEN threshold the cluster.
+    #
+    # D5: the cluster KEY is (file, function) -- NOT (file, line, function).
+    # Real helper code issues its co-occurring statements on several different
+    # source LINES of ONE function (a SELECT on line 88, an UPDATE on 90, an
+    # audit INSERT on 93). Keying on the exact line fragmented that single N+1
+    # workflow into three sub-threshold clusters, so R4 never fired on the very
+    # pattern it exists to catch. Each group's own line is still kept for
+    # DISPLAY (the representative site is the dominant group's own file:line).
+    #
+    # D6 (companion guard, same "coarsening merges unrelated groups" family):
+    # one-shot (calls == 1) statements are fixed cost by this module's own
+    # definition -- they feed `fixed_cost_time` above and are R5's job. They do
+    # NOT co-occur per iteration, so a big loop plus the DDL/PRAGMA/count(*)
+    # that happen to live in the same function must not be reported as "N query
+    # groups fire together". Exclude them from clustering entirely.
     clusters: "dict[tuple, list]" = {}
     for g in run.groups:
         if g.call_site is None:
             continue  # can't attribute -> can't cluster
-        clusters.setdefault(g.call_site, []).append(g)
+        if g.calls <= 1:
+            continue  # one-shot fixed cost, not a co-occurring per-iteration group
+        clusters.setdefault((g.call_site[0], g.call_site[2]), []).append(g)
 
     r1_absorbed = False
-    for site, gs in clusters.items():
+    for (site_file, site_func), gs in clusters.items():
         distinct = {g.key for g in gs}
         if len(distinct) < 2:
             continue  # single-group hotspots are R1's job, not R4's
         combined_calls = sum(g.calls for g in gs)
         combined_time = sum(g.total_time for g in gs)
-        if not (combined_calls > 1000 and combined_time > 0.10 * wall):
+        iterations = max(g.calls for g in gs)
+        per_iter = combined_calls / iterations if iterations else 0
+
+        # D6: coarsening the key to (file, function) can newly MERGE unrelated
+        # statements -- e.g. a direct session.execute(select(...)) on line 60
+        # plus the writes a session.commit() flushes on line 88. Distinguish
+        # the two honestly using the distinct SOURCE LINES in the cluster:
+        #   >= 2 lines            -> a genuine multi-line workflow (the D5 case)
+        #   1 line + write-shaped -> the ORM unit-of-work flush signature
+        # A single-line write cluster is NOT told to "collapse into one
+        # round-trip" (it is already one flush) and is not promoted by the pure
+        # scale trigger alone -- it must also clear a wall% bar.
+        distinct_lines = {ln for ln in (_site_line(g) for g in gs) if ln is not None}
+        write_calls = sum(g.calls for g in gs if _is_write(g.normalized_sql))
+        write_dominated = combined_calls > 0 and write_calls >= _WRITE_DOMINANCE * combined_calls
+        flush_signature = len(distinct_lines) <= 1 and write_dominated
+
+        # FIX R4: fire on SCALE, not just this run's wall%. A cluster that is a
+        # small share of the raw clock can still be the dominant cost at full
+        # volume: it may clear 10% once one-time setup is excluded, or it may be
+        # obviously per-iteration (>=200 iterations, >=3 queries each).
+        wall_pct_trigger = (
+            combined_time > 0.10 * wall                      # raw wall%
+            or combined_time > 0.10 * variable_wall          # setup-excluded wall%
+        )
+        scale_trigger = iterations >= 200 and per_iter >= 3  # absolute scale trigger
+        qualifies = combined_calls > 1000 and (
+            wall_pct_trigger or (scale_trigger and not flush_signature)
+        )
+        if not qualifies:
             continue
 
         gs_sorted = sorted(gs, key=lambda g: g.total_time, reverse=True)
-        site_str = _site_str(gs_sorted[0])
-        detail_lines = [f"{len(gs_sorted)} query groups fire together from {site_str} in {site[2]}:"]
+        site_str = _site_str(gs_sorted[0])   # dominant group's OWN file:line
+        excluded_pct = combined_time / variable_wall * 100
+        detail_lines = [
+            f"{len(gs_sorted)} query groups fire together from {site_str} in {site_func}:"
+        ]
         for g in gs_sorted:
-            detail_lines.append(f"  - {g.normalized_sql} ({g.calls:,} calls, {g.total_time:.1f}s)")
+            ln = _site_line(g)
+            where = f" at {site_file}:{ln}" if ln is not None else ""
+            detail_lines.append(
+                f"  - {g.normalized_sql} ({g.calls:,} calls, {g.total_time:.1f}s){where}"
+            )
         detail_lines.append(
             f"combined: {combined_calls:,} calls, {combined_time:.1f}s "
-            f"= {combined_time / wall * 100:.0f}% of {wall:.1f}s wall."
+            f"= {combined_time / wall * 100:.0f}% of {wall:.1f}s wall "
+            f"({excluded_pct:.0f}% once {fixed_cost_time:.1f}s of one-time setup is excluded)."
+        )
+        detail_lines.append(
+            f"~= {per_iter:.1f} queries/iteration across ~{iterations:,} iterations from {site_str} "
+            f"-- this scales linearly with units, so it becomes the dominant cost at full "
+            f"volume even though it did not win this bounded run's clock."
         )
 
         # B2: honest per-iteration estimate, only when the signal is strong
@@ -156,10 +264,27 @@ def evaluate(run: RunSnapshot) -> "list[Finding]":
                 f"~= {per_iter:.1f} queries per iteration (~{max_calls:,} iterations)."
             )
 
-        detail_lines.append(
-            f"{len(gs_sorted)} queries fire together per iteration from {site_str} "
-            f"-> collapse into one round-trip (JOIN / batch / eager-load)."
-        )
+        if flush_signature:
+            # Honesty over cleverness: never tell a user to merge round-trips
+            # that a single flush already merged.
+            detail_lines.append(
+                "Note: these statements share one call site and may be emitted by a single "
+                "session.flush()/commit() (ORM unit-of-work) — verify they are not already "
+                "batched before splitting."
+            )
+            detail_lines.append(
+                f"{len(gs_sorted)} write shapes are emitted together at {site_str} "
+                f"-> if they already leave the app in one flush, the win is FEWER/BULKIER "
+                f"statements per unit of work (bulk insert / bulk update), not merging "
+                f"round-trips."
+            )
+        else:
+            detail_lines.append(
+                f"{len(gs_sorted)} queries fire together per iteration from {site_str} "
+                f"-> collapse into one round-trip (JOIN / batch / eager-load)."
+            )
+        if cpu_caveat is not None:
+            detail_lines.append(cpu_caveat)
         findings.append(Finding("R4", "Co-occurring query pattern", "\n".join(detail_lines), combined_time))
 
         # Prevent double-counting with R1: if R1 fired STANDALONE on a group
@@ -174,7 +299,151 @@ def evaluate(run: RunSnapshot) -> "list[Finding]":
     if r1_absorbed:
         findings = [f for f in findings if f.rule != "R1"]
 
-    # suppress trivia, sort, cap at 3
-    findings = [f for f in findings if f.seconds >= 0.05 * wall]
+    # --- R5: one-shot heavyweight statement -----------------------------------
+    # A single calls==1 statement over 15% of wall OR over R5_ABS_SECONDS in
+    # absolute terms. Invisible to R1/R3/R4, which all assume chattiness.
+    # Independent & additive: never merged or suppressed against R1-R4; ranks in
+    # top-3 by seconds like any other finding.
+    #
+    # D7: the absolute floor exists because a percentage-only gate is
+    # scale-blind in the opposite direction to R4's bug -- a 20.7s preload is
+    # 25% of a bounded sample run but <1% of the full run, so a %-only R5 goes
+    # silent on the run that actually matters.
+    try:
+        one_shots = [g for g in run.groups if g.calls == 1]
+        if one_shots:
+            g = max(one_shots, key=lambda x: x.total_time)
+            over_pct = g.total_time > 0.15 * wall
+            over_abs = g.total_time > R5_ABS_SECONDS
+            if over_pct or over_abs:
+                where = _site_str(g) if g.call_site else g.normalized_sql
+                pct = g.total_time / wall * 100
+                if over_pct:
+                    arithmetic = f"= {pct:.0f}% of {wall:.1f}s wall."
+                else:
+                    # absolute path: a small % but a large number of seconds --
+                    # say both, so the number reads honestly.
+                    arithmetic = (
+                        f"= {pct:.0f}% of wall ({g.total_time:.1f}s absolute, over the "
+                        f"{R5_ABS_SECONDS:.0f}s floor) on a {wall:.1f}s wall."
+                    )
+                detail = (
+                    f"1 statement at {where} took {g.total_time:.1f}s "
+                    f"{arithmetic}\n"
+                    f"It runs once regardless of input size, so R1/R3/R4 (which look for "
+                    f"chattiness) miss it -- but it is the single biggest fixed cost. "
+                    f"Cache, narrow, or stream it."
+                )
+                findings.append(
+                    Finding("R5", "One-shot heavyweight statement", detail, g.total_time)
+                )
+    except Exception:
+        pass
+
+    # --- R6: rising per-unit cost (unit-aware) --------------------------------
+    # Only when unit mode was on. Cost per unit climbing over the run is a strong
+    # "growing per-item work" signal that program-wide totals hide entirely.
+    try:
+        us = run.unit_stats
+    except AttributeError:
+        us = None
+    if us is not None:
+        try:
+            # D9: duration is only half the story. A CPU-bound job whose
+            # queries/unit climbs is exactly the shape reviewers care about, and
+            # a duration-only trigger misses it. Read the query windows
+            # DEFENSIVELY -- they are appended fields and may be absent on an
+            # older snapshot.
+            first = getattr(us, "first_window_mean_duration", None)
+            last = getattr(us, "last_window_mean_duration", None)
+            first_q = getattr(us, "first_window_mean_queries", None)
+            last_q = getattr(us, "last_window_mean_queries", None)
+
+            dur_present = first is not None and last is not None and first > 0
+            q_present = first_q is not None and last_q is not None and first_q > 0
+            dur_ok = dur_present and last >= 1.5 * first
+            q_ok = q_present and last_q >= 1.5 * first_q
+
+            if us.count >= 20 and (dur_ok or q_ok):
+                parts: "list[str]" = []
+                if dur_present:
+                    delta_pct = (last - first) / first * 100
+                    parts.append(
+                        f"first 100 units averaged {first * 1000:.0f} ms; "
+                        f"last 100 averaged {last * 1000:.0f} ms ({delta_pct:+.0f}%)."
+                    )
+                if q_present:
+                    q_pct = (last_q - first_q) / first_q * 100
+                    verb = "rose" if q_pct >= 0 else "fell"
+                    parts.append(
+                        f"queries/unit {verb} from {first_q:.0f} (first 100) to "
+                        f"{last_q:.0f} (last 100) ({q_pct:+.0f}%)."
+                    )
+                parts.append(
+                    "Cost per unit is climbing -- likely growing per-item work "
+                    "(accumulating state, unbatched history reads, or a list that "
+                    "grows each iteration)."
+                )
+                if cpu_caveat is not None:
+                    parts.append(cpu_caveat)
+                detail = " ".join(parts)
+
+                # D10: PREFER the query-derived attribution over the
+                # duration-derived one whenever it is computable. Per-unit query
+                # counts are exact integers the recorder attributes directly,
+                # with zero clock involvement, so the same fixture yields the
+                # same number every run. `first_window_mean_duration` is NOT a
+                # clean baseline: the first window pays one-time SQLAlchemy
+                # statement-compilation warmup, which is not part of the
+                # steady-state per-unit price. That inflates the baseline and so
+                # biases the attributed seconds LOW by construction -- enough,
+                # on real runs, to push R6 under the trivia filter on some runs
+                # and not others for a byte-identical workload. Duration stays
+                # as the fallback for snapshots with no query windows.
+                dur_seconds = None
+                if first is not None and first > 0:
+                    dur_seconds = max(0.0, (us.mean_duration - first) * us.count)
+
+                q_seconds = None
+                try:
+                    if q_present:
+                        # Conservative pricing: the EXTRA queries per unit above
+                        # the first window, charged at the run's mean per-query
+                        # DB time. Never negative, never a crash.
+                        per_q = (
+                            (run.db_time / run.total_queries) if run.total_queries > 0 else 0.0
+                        )
+                        excess = max(0.0, (us.mean_queries - first_q)) * us.count
+                        q_seconds = max(0.0, excess * per_q)
+                except Exception:
+                    q_seconds = None
+
+                if q_seconds is not None and q_seconds > 0.0:
+                    seconds = q_seconds
+                elif dur_seconds is not None:
+                    seconds = dur_seconds
+                else:
+                    seconds = 0.0
+                findings.append(Finding("R6", "Rising per-unit cost", detail, seconds))
+        except Exception:
+            pass
+
+    # suppress trivia, sort, cap at 3.
+    # D7: the "< 5% of wall" bar would re-suppress an absolute-floor R5 (or any
+    # genuinely large finding) on a huge run, so anything big in ABSOLUTE terms
+    # survives too.
+    #
+    # D10: R6 is a TREND finding, so a share-of-CURRENT-wall bar is the wrong
+    # question to ask it. Its whole claim is that the per-unit price is rising
+    # and will dominate at full volume, NOT that it owns this bounded run's
+    # clock -- its current-run magnitude is small by construction. Gating it on
+    # 5% of wall meant a real, reproducible per-unit regression went silent
+    # whenever the sample run happened to be short. Same spirit as D7's absolute
+    # escape hatch: don't let a %-of-wall bar silence a scale signal. R6's own
+    # 1.5x firing bar remains the thing that decides whether it is real.
+    findings = [
+        f for f in findings
+        if f.rule == "R6" or f.seconds >= 0.05 * wall or f.seconds >= KEEP_ABS_SECONDS
+    ]
     findings.sort(key=lambda f: f.seconds, reverse=True)
     return findings[:3]

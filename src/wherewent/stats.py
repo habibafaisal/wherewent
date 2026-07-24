@@ -13,10 +13,35 @@ class GroupSnapshot:
     normalized_sql: str
     calls: int
     total_time: float            # seconds, app-observed (includes driver+network+server)
-    median: float                # seconds; 0.0 if no samples
+    # v0.3 hardening (D1): a bounded SAMPLE median (reservoir cap 5000), not an
+    # exact one, once a group exceeds the cap. `calls` and `total_time` stay
+    # EXACT. 0.0 if no samples.
+    median: float                # seconds; sample median; 0.0 if no samples
     rows: int                    # summed cursor.rowcount where >= 0, else 0 contribution
     executemany_calls: int
     call_site: "tuple[str, int, str] | None"  # (file, line, function); None if unresolved
+
+
+@dataclass
+class UnitStats:
+    name: str                    # the SPEC string as given, e.g. "myapp.jobs:process_receivable"
+    wrapped: bool                # True once the target was actually patched (else nothing ran)
+    count: int                   # number of top-level unit executions recorded
+    median_duration: float       # seconds
+    mean_duration: float         # seconds
+    median_queries: float
+    mean_queries: float
+    mean_commits: float
+    mean_rollbacks: float
+    mean_rows: float
+    first_window_n: int          # units in the FIRST window (<= 100)
+    first_window_mean_duration: "float | None"   # None if no units yet
+    last_window_n: int           # units in the LAST window (<= 100)
+    last_window_mean_duration: "float | None"    # None if no units yet
+    # v0.3 hardening (D4): per-unit query-slope windows. APPENDED after the
+    # existing fields so positional consumers (rules/report/tests) are unaffected.
+    first_window_mean_queries: "float | None"    # None if no units yet
+    last_window_mean_queries: "float | None"     # None if no units yet
 
 
 @dataclass
@@ -32,6 +57,10 @@ class RunSnapshot:
     overhead_time: float         # recorder's own measured hook time, seconds
     sqlalchemy_active: bool      # were hooks installed and did SQLAlchemy get used
     groups: "list[GroupSnapshot]" = field(default_factory=list)
+    unit_stats: "UnitStats | None" = None
+    # v0.3 hardening (D2): DBAPI rollback time, split out of commit_time. None
+    # when not measurable. Includes pool-reset rollbacks (report.py labels it).
+    rollback_time: "float | None" = None
 
 
 @dataclass

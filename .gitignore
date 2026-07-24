@@ -23,6 +23,7 @@ htmlcov/
 *.json.wherewent
 demo_events.db
 demo/*.db
+unit_job_demo*.db
 naive.json
 fixed.json
 
@@ -31,3 +32,7 @@ fixed.json
 *.swp
 .idea/
 .vscode/
+
+# Local agent/session working dirs (not part of the published project)
+.claude/
+.handoff/
