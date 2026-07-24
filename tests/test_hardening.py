@@ -773,3 +773,148 @@ def test_d11_scale_triggered_r4_survives_the_wall_pct_trivia_filter():
     assert [f.rule for f in findings] == ["R4"], (
         f"expected exactly ['R4'], got {[f.rule for f in findings]}"
     )
+
+
+# ==========================================================================
+# D12 -- R4's iteration estimate must survive a group that fires MORE THAN
+#        ONCE per iteration
+# ==========================================================================
+# Regression for a FALSE NEGATIVE reproduced deterministically on CI (all 4
+# Python versions) with demo/unit_job.py's 400-unit fixture. All four query
+# groups live in ONE function (`process_one`) on four distinct lines, and the
+# history count(*) fires SEVERAL times per unit on later units:
+#
+#     SELECT unit_job_receivables  :166    400 calls   0.01s
+#     UPDATE unit_job_receivables  :169    400 calls   0.03s
+#     INSERT unit_job_history      :171    400 calls   0.01s
+#     SELECT count(*) FROM history :177    720 calls   0.028s
+#     combined = 1,920 calls / 0.078s over 400 units; wall 2.616s; the one-shot
+#     self-join at :136 is a 1.69s fixed cost.
+#
+# Both qualifying paths missed, narrowly:
+#   - `iterations = max(calls) = 720` -> per_iter = 1920/720 = 2.67 < 3, so the
+#     scale trigger was OFF. The TRUE iteration count is 400 (400 units), which
+#     gives per_iter = 4.8 >= 3.
+#   - variable_wall = 2.616 - 1.69 = 0.926s, so the setup-excluded 10% bar is
+#     0.0926s while combined_time is 0.078s -> the wall% trigger was OFF too
+#     (and 0.078s is likewise under 10% of the 2.616s RAW wall).
+#
+# Root cause: `max` assumes every group fires at most ONCE per iteration. A
+# group firing several times per iteration -- the growing-N+1 shape R4 exists
+# to catch -- inflates the denominator and DEFLATES per_iter, so R4 under-claims
+# itself out of firing exactly when the pattern is worst. The estimator now uses
+# the MEDIAN of the per-group call counts (median([400,400,400,720]) = 400).
+# The >=200 / >=3 bars are unchanged; only the estimate was corrected.
+#
+# On the developer's Mac the same fixture's cluster cost ~0.22s, so the wall%
+# path carried it and the defect was invisible -- CI-only, disk-speed-dependent.
+
+_D12_SITE_SELECT = ("demo/unit_job.py", 166, "process_one")
+_D12_SITE_UPDATE = ("demo/unit_job.py", 169, "process_one")
+_D12_SITE_INSERT = ("demo/unit_job.py", 171, "process_one")
+_D12_SITE_COUNT = ("demo/unit_job.py", 177, "process_one")
+_D12_SITE_ONESHOT = ("demo/unit_job.py", 136, "seed_receivables")
+
+_D12_WALL = 2.616        # observed CI wall clock
+_D12_FIXED_COST = 1.69   # observed CI one-shot heavyweight self-join at :136
+
+
+def _d12_ci_unit_fixture_run():
+    """The CI cluster verbatim: 4 groups, one of them firing 1.8x per iteration."""
+    groups = [
+        make_group(key="select_receivable",
+                   normalized_sql="SELECT * FROM unit_job_receivables WHERE id = ?",
+                   calls=400, total_time=0.01, median=0.000025,
+                   call_site=_D12_SITE_SELECT),
+        make_group(key="update_receivable",
+                   normalized_sql="UPDATE unit_job_receivables SET status = ? WHERE id = ?",
+                   calls=400, total_time=0.03, median=0.000075,
+                   call_site=_D12_SITE_UPDATE),
+        make_group(key="insert_history",
+                   normalized_sql="INSERT INTO unit_job_history VALUES (?, ?, ?)",
+                   calls=400, total_time=0.01, median=0.000025,
+                   call_site=_D12_SITE_INSERT),
+        # fires MULTIPLE times per unit on later units -- 720 calls over 400
+        # units. This is the group that used to poison `max(calls)`.
+        make_group(key="count_history",
+                   normalized_sql="SELECT count(*) FROM unit_job_history WHERE unit_id = ?",
+                   calls=720, total_time=0.028, median=0.000039,
+                   call_site=_D12_SITE_COUNT),
+    ]
+    one_shot = make_group(
+        key="heavy_self_join",
+        normalized_sql="SELECT a.id FROM unit_job_receivables a JOIN unit_job_receivables b ON ?",
+        calls=1, total_time=_D12_FIXED_COST, median=_D12_FIXED_COST,
+        call_site=_D12_SITE_ONESHOT,
+    )
+    return make_run(
+        wall_time=_D12_WALL, cpu_time=1.2, total_queries=1921,
+        db_time=0.078 + _D12_FIXED_COST, groups=groups + [one_shot],
+    )
+
+
+def test_d12_fixture_really_defeats_both_wall_pct_paths():
+    # Guard the guard: if either wall% path ever carries this fixture, the test
+    # below stops proving anything about the iteration estimator.
+    run = _d12_ci_unit_fixture_run()
+    cluster = [g for g in run.groups if g.calls > 1]
+    combined_calls = sum(g.calls for g in cluster)
+    combined_time = sum(g.total_time for g in cluster)
+    fixed_cost_time = sum(g.total_time for g in run.groups if g.calls == 1)
+    variable_wall = run.wall_time - fixed_cost_time
+
+    assert combined_calls == 1920                       # > the 1000 gate
+    assert combined_time == pytest.approx(0.078)
+    assert combined_time <= 0.10 * run.wall_time, "raw wall%% path must be OFF"
+    assert combined_time <= 0.10 * variable_wall, "setup-excluded wall%% path must be OFF"
+    # ...and the OLD max-based estimator misses the >=3 bar, which is the defect.
+    assert combined_calls / max(g.calls for g in cluster) < 3.0
+
+
+def test_d12_r4_fires_when_one_group_fires_several_times_per_iteration():
+    run = _d12_ci_unit_fixture_run()
+
+    findings = evaluate(run)
+    r4 = [f for f in findings if f.rule == "R4"]
+    assert len(r4) == 1, (
+        f"R4 must fire on the CI unit fixture via the SCALE trigger, "
+        f"got {[f.rule for f in findings]}"
+    )
+    assert r4[0].seconds == pytest.approx(0.078)
+
+    # The rendered numbers must be the CORRECTED ones: ~400 iterations (the
+    # real unit count), not 720, and ~4.8 queries/iteration, not 2.7.
+    detail = r4[0].detail
+    assert "4.8 queries/iteration" in detail, detail
+    assert "~400 iterations" in detail, detail
+    assert "720 iterations" not in detail, detail
+
+
+def test_d12_median_estimator_is_unchanged_for_equal_call_counts():
+    # The async-demo shape: 2 groups with identical call counts. median == max
+    # there, so the corrected estimator must produce byte-identical numbers and
+    # this case must not move at all.
+    groups = [
+        make_group(key="sel", normalized_sql="SELECT * FROM orders WHERE id = ?",
+                   calls=1500, total_time=1.2, median=0.0008,
+                   call_site=("async_job.py", 40, "fetch_one")),
+        make_group(key="upd", normalized_sql="UPDATE orders SET state = ? WHERE id = ?",
+                   calls=1500, total_time=1.2, median=0.0008,
+                   call_site=("async_job.py", 44, "fetch_one")),
+    ]
+    run = make_run(wall_time=20.0, cpu_time=2.0, db_time=2.4, groups=groups)
+
+    findings = evaluate(run)
+    r4 = [f for f in findings if f.rule == "R4"]
+    assert len(r4) == 1
+    assert "2.0 queries/iteration across ~1,500 iterations" in r4[0].detail, r4[0].detail
+
+
+def test_d12_median_estimator_cannot_raise_on_degenerate_input():
+    # Empty / zero-count clusters must be impossible to crash on. Groups with
+    # calls <= 1 are excluded from clustering entirely, so the only way in is
+    # directly: assert the helper itself is total.
+    assert rules._median([]) == 0.0
+    assert rules._median([0, 0]) == 0.0
+    assert rules._median([5]) == 5.0
+    assert rules._median([1, 2, 3, 4]) == 2.5

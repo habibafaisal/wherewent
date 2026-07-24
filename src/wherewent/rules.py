@@ -61,6 +61,21 @@ def _is_write(sql) -> bool:
         return False
 
 
+def _median(values) -> float:
+    """Median of *values*; 0.0 for an empty input. Never raises."""
+    try:
+        vals = sorted(values)
+    except Exception:
+        return 0.0
+    n = len(vals)
+    if n == 0:
+        return 0.0
+    mid = n // 2
+    if n % 2:
+        return float(vals[mid])
+    return (float(vals[mid - 1]) + float(vals[mid])) / 2.0
+
+
 def _within(a: float, b: float, frac: float) -> bool:
     """True if a and b are within *frac* of each other (relative)."""
     hi = max(a, b)
@@ -213,8 +228,27 @@ def evaluate(run: RunSnapshot) -> "list[Finding]":
             continue  # single-group hotspots are R1's job, not R4's
         combined_calls = sum(g.calls for g in gs)
         combined_time = sum(g.total_time for g in gs)
-        iterations = max(g.calls for g in gs)
-        per_iter = combined_calls / iterations if iterations else 0
+        # D12: estimate the ITERATION COUNT from the MEDIAN of the cluster's
+        # per-group call counts, not the max. `max` silently assumes every
+        # group fires AT MOST ONCE per iteration; when one group fires SEVERAL
+        # times per iteration -- precisely the growing-N+1 shape R4 exists to
+        # catch -- that group's call count inflates the denominator and
+        # DEFLATES per_iter, so the estimator is least accurate exactly when
+        # the pattern is worst and R4 under-claims itself out of firing. In a
+        # genuine co-occurring workflow most groups fire about once per
+        # iteration, so the median group's call count estimates how many times
+        # the pattern repeated: the max is skewed UP by any group that fires
+        # several times per iteration, the min is skewed DOWN by any group that
+        # fires only conditionally, and the median resists both.
+        # Observed on CI (demo unit fixture, 400 units): calls
+        # [400, 400, 400, 720] -> max gives 720 iterations x 2.67 queries
+        # (scale trigger OFF, R4 silent); the median gives the TRUE 400
+        # iterations x 4.8 queries (scale trigger ON). Rounded to a whole
+        # number so the ratio and the "~N iterations" it is rendered with stay
+        # arithmetically consistent. The >=200 / >=3 bars are UNCHANGED -- this
+        # corrects the estimator, it does not lower a threshold.
+        iterations = int(round(_median([g.calls for g in gs])))
+        per_iter = combined_calls / iterations if iterations > 0 else 0
 
         # D6: coarsening the key to (file, function) can newly MERGE unrelated
         # statements -- e.g. a direct session.execute(select(...)) on line 60
@@ -273,7 +307,16 @@ def evaluate(run: RunSnapshot) -> "list[Finding]":
         # the cluster's max group calls) -- never guess otherwise.
         max_calls = max(g.calls for g in gs_sorted)
         near_equal = [g for g in gs_sorted if _within(g.calls, max_calls, 0.25)]
-        if max_calls > 0 and len(near_equal) >= 2:
+        # D12: this block is a SECOND, max-based reading of the same question the
+        # line above already answers from the median. While both used the max
+        # they always agreed; now they can disagree (calls [1000, 1000, 100, 100]
+        # renders "~= 4.0 queries/iteration across ~550 iterations" from the
+        # median and "~= 2.2 queries per iteration (~1,000 iterations)" from the
+        # max -- two different answers in one report). Emit it only when the two
+        # readings AGREE, i.e. when the max IS the median-based estimate. This
+        # changes no threshold and no firing gate: it only drops a display line
+        # that would otherwise contradict the estimate this rule actually used.
+        if max_calls > 0 and len(near_equal) >= 2 and max_calls == iterations:
             per_iter = combined_calls / max_calls
             detail_lines.append(
                 f"~= {per_iter:.1f} queries per iteration (~{max_calls:,} iterations)."

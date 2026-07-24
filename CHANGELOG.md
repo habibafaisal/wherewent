@@ -72,6 +72,17 @@ A review pass against real workloads found nine defects; all are fixed in this r
   recording, still without ever raising into the host job.
 - **`Recorder.disable()`** added to fully unwind class-level hooks, dialect wrappers and
   import hooks — for embedders and test isolation.
+- **R4 under-counted queries-per-iteration, and missed the growing N+1 entirely.** The
+  iteration count was estimated as the *largest* group's call count, which silently assumes
+  every group fires at most once per iteration. When one group fires several times per
+  iteration — precisely the growing-N+1 shape R4 exists to catch — that group inflates the
+  denominator and deflates the ratio, so the estimator is least accurate exactly when the
+  problem is worst. On CI the demo cluster read `1920 / 720 = 2.67` queries/iteration against
+  a bar of 3 and disqualified itself; the truth is `1920 / 400 = 4.8` across 400 units. The
+  estimate is now the **median** group call count, which resists both a group that fires many
+  times per iteration and one that fires only conditionally. Thresholds are unchanged — this
+  corrects the estimator, not the bar. A per-iteration display line is now suppressed when it
+  would contradict the estimate the rule actually used.
 - **R4 was deleted by the suppression filter on exactly the runs it exists for.** R4's whole
   premise is that a scaling N+1 must be reported even when it is a small share of a bounded
   run's wall clock — that is why it has a scale trigger alongside its percent-of-wall path.
