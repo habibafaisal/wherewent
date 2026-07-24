@@ -36,7 +36,7 @@ from sqlalchemy import create_engine, text
 
 from wherewent import report, rules
 from wherewent.recorder import Recorder, _DUR_RESERVOIR_CAP
-from wherewent.rules import evaluate
+from wherewent.rules import KEEP_ABS_SECONDS, evaluate
 from wherewent.stats import GroupSnapshot, RunSnapshot, UnitStats
 
 
@@ -684,3 +684,92 @@ def test_d9_no_query_line_when_query_windows_absent():
     r6 = [f for f in findings if f.rule == "R6"]
     assert len(r6) == 1
     assert "queries/unit" not in r6[0].detail
+
+
+# ==========================================================================
+# D11 -- a SCALE-triggered R4 must survive the final %-of-wall trivia filter
+# ==========================================================================
+# Regression for a defect reproduced deterministically on CI (all 4 Python
+# versions): R4 fired correctly via its absolute SCALE trigger and was then
+# silently DELETED by evaluate()'s closing suppression filter, which kept a
+# finding only if `f.rule == "R6" or f.seconds >= 0.05 * wall or
+# f.seconds >= KEEP_ABS_SECONDS`. R4's seconds are the cluster's combined_time,
+# which is small by construction on a bounded/sampled run -- that is the exact
+# reason the scale trigger exists. Numbers below mirror the observed CI run of
+# demo/benchmark.py's unit section:
+#     GitHub CI runner: combined_time=0.078s, wall=2.653s -> 2.9%  (R4 DELETED)
+#     local Mac:        combined_time=0.232s, wall=3.571s -> 6.5%  (R4 survived)
+# i.e. the same byte-identical workload reported a different rule set purely as
+# a function of disk speed. Not the findings[:3] cap: only 2 findings existed.
+
+_R4_CI_SITE_SELECT = ("demo/benchmark.py", 120, "process_one_unit")
+_R4_CI_SITE_UPDATE = ("demo/benchmark.py", 123, "process_one_unit")
+_R4_CI_SITE_INSERT = ("demo/benchmark.py", 127, "process_one_unit")
+
+_R4_CI_WALL = 2.653          # observed CI wall clock
+_R4_CI_COMBINED_TIME = 0.078  # observed CI cluster combined_time (2.9% of wall)
+
+
+def _r4_scale_triggered_under_the_bar_run():
+    """A cluster that fires via SCALE alone while sitting UNDER 5%% of wall.
+
+    3 distinct source lines of one function x 400 iterations each:
+      - combined_calls = 1200 (> the 1000 gate)
+      - iterations = 400 (>= 200) and per_iter = 3.0 (>= 3) -> scale trigger ON
+      - 3 distinct lines -> NOT the D6 flush signature, so scale alone promotes
+      - combined_time = 0.078s, which is BELOW 10%% of wall (0.2653s) and below
+        10%% of variable_wall (no calls==1 groups exist, so variable_wall ==
+        wall) -> the wall%% trigger is OFF; scale is the ONLY reason R4 fires.
+    """
+    per_group_time = _R4_CI_COMBINED_TIME / 3
+    groups = [
+        make_group(key="select_unit", normalized_sql="SELECT * FROM chain_state WHERE id = ?",
+                   calls=400, total_time=per_group_time, median=0.00006,
+                   call_site=_R4_CI_SITE_SELECT),
+        make_group(key="update_unit", normalized_sql="UPDATE chain_state SET state = ? WHERE id = ?",
+                   calls=400, total_time=per_group_time, median=0.00006,
+                   call_site=_R4_CI_SITE_UPDATE),
+        make_group(key="insert_audit", normalized_sql="INSERT INTO audit_log VALUES (?, ?, ?)",
+                   calls=400, total_time=per_group_time, median=0.00006,
+                   call_site=_R4_CI_SITE_INSERT),
+    ]
+    return make_run(
+        wall_time=_R4_CI_WALL, cpu_time=2.3, total_queries=1200,
+        db_time=_R4_CI_COMBINED_TIME, groups=groups,
+    )
+
+
+def test_d11_scale_triggered_r4_survives_the_wall_pct_trivia_filter():
+    run = _r4_scale_triggered_under_the_bar_run()
+    wall = run.wall_time
+
+    findings = evaluate(run)
+    r4 = [f for f in findings if f.rule == "R4"]
+    assert len(r4) == 1, (
+        f"a scale-triggered R4 must survive the final trivia filter, "
+        f"got {[f.rule for f in findings]}"
+    )
+
+    finding = r4[0]
+    # The POINT of the regression: it is present *while* below the bar that
+    # used to delete it. Asserting only "R4 in findings" would silently pass
+    # again if someone re-tuned the numbers instead of exempting the rule.
+    assert finding.seconds == pytest.approx(_R4_CI_COMBINED_TIME)
+    assert finding.seconds < 0.05 * wall, (
+        f"fixture no longer exercises the defect: {finding.seconds:.4f}s is not "
+        f"below the 5%% trivia bar ({0.05 * wall:.4f}s)"
+    )
+    assert finding.seconds < KEEP_ABS_SECONDS, (
+        "fixture no longer exercises the defect: the absolute escape hatch "
+        "would have kept this finding regardless of the %-of-wall bar"
+    )
+    # ...and while the wall%% FIRING path is off too, so scale is provably the
+    # only reason it fired at all.
+    assert finding.seconds <= 0.10 * wall
+
+    # The other half of the CI symptom: nothing else in this fixture fires, so
+    # R4 is the whole difference between a useful report and an empty one --
+    # and this is NOT the findings[:3] cap (there is only one finding).
+    assert [f.rule for f in findings] == ["R4"], (
+        f"expected exactly ['R4'], got {[f.rule for f in findings]}"
+    )

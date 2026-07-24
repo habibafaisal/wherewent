@@ -13,6 +13,21 @@ from .stats import Finding, RunSnapshot
 R5_ABS_SECONDS = 10.0     # one-shot heavyweight absolute floor (seconds)
 KEEP_ABS_SECONDS = 10.0   # trivia-filter escape hatch: keep anything this big
 
+# D11: rules whose entire claim is about SCALE/TREND rather than about owning
+# THIS bounded run's clock. Asking them to clear a "% of current wall" bar asks
+# the wrong question by construction, so the final trivia filter must not delete
+# them -- their own firing gates are what decide whether they are real. See the
+# long D11 note at the filter itself.
+_WALL_PCT_EXEMPT_RULES = frozenset({"R4", "R6"})
+
+
+def _exempt_from_wall_pct_bar(finding) -> bool:
+    """True when the trivia filter's %-of-wall bar must not apply to *finding*."""
+    try:
+        return finding.rule in _WALL_PCT_EXEMPT_RULES
+    except Exception:
+        return False
+
 # SQL shapes that an ORM unit-of-work emits at flush()/commit() time. Used only
 # by R4's flush-attribution guard (D6) -- deliberately simple prefix matching;
 # perfect flush detection is out of scope.
@@ -441,9 +456,28 @@ def evaluate(run: RunSnapshot) -> "list[Finding]":
     # whenever the sample run happened to be short. Same spirit as D7's absolute
     # escape hatch: don't let a %-of-wall bar silence a scale signal. R6's own
     # 1.5x firing bar remains the thing that decides whether it is real.
+    #
+    # D11: R4 is the SAME shape of finding as R6 and needs the SAME treatment.
+    # R4 deliberately fires on an absolute SCALE trigger (>= 200 iterations x
+    # >= 3 co-located queries each) precisely so that an N+1 spread across
+    # several query groups is reported even when it is a small share of a
+    # bounded run's clock -- on a sampled or partial run, one-time fixed costs
+    # own the clock while the per-iteration pattern is the thing that scales.
+    # Re-applying the generic 5%-of-wall bar here re-imposed the very bar the
+    # scale trigger exists to bypass and SILENTLY DELETED the finding after it
+    # had correctly fired (observed on CI: combined_time 0.078s on a 2.653s
+    # wall = 3.0%, R4 computed then dropped; the same fixture kept R4 locally at
+    # 6.5%, so the bug was disk-speed-dependent). An R4 that qualified via the
+    # wall% path already clears this bar on its own, so exempting R4 outright
+    # changes nothing for it and only rescues the scale-triggered case. R4's own
+    # firing gates (combined_calls > 1000, the calls<=1 one-shot exclusion, and
+    # the D6 flush-attribution guard) remain the things that decide whether it
+    # is real. Same defect family as D7 (R5's absolute escape hatch) and D10.
     findings = [
         f for f in findings
-        if f.rule == "R6" or f.seconds >= 0.05 * wall or f.seconds >= KEEP_ABS_SECONDS
+        if _exempt_from_wall_pct_bar(f)
+        or f.seconds >= 0.05 * wall
+        or f.seconds >= KEEP_ABS_SECONDS
     ]
     findings.sort(key=lambda f: f.seconds, reverse=True)
     return findings[:3]

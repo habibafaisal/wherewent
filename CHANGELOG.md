@@ -72,6 +72,15 @@ A review pass against real workloads found nine defects; all are fixed in this r
   recording, still without ever raising into the host job.
 - **`Recorder.disable()`** added to fully unwind class-level hooks, dialect wrappers and
   import hooks — for embedders and test isolation.
+- **R4 was deleted by the suppression filter on exactly the runs it exists for.** R4's whole
+  premise is that a scaling N+1 must be reported even when it is a small share of a bounded
+  run's wall clock — that is why it has a scale trigger alongside its percent-of-wall path.
+  But the final trivia filter then re-imposed a `≥ 5% of wall` bar and dropped the finding, so
+  the rule fired and was silently undone. Caught by CI on all four Python versions: the demo
+  cluster measured `0.078s / 2.653s = 3.0%` there versus 6.5% on the developer's machine, so
+  it vanished on the slower-relative-disk runner. Scale and trend findings (R4, R6) are now
+  exempt from the percent-of-wall bar; their own firing gates remain the quality bar. Anyone
+  profiling a short sample of a long job — the primary use case — would have hit this.
 - **R6 fired nondeterministically on identical input.** Its attributed seconds were derived
   from `(mean_duration − first_window_mean_duration) × count`, but the first window pays
   one-time SQLAlchemy statement-compilation warmup, which is not part of the steady-state
